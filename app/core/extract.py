@@ -184,10 +184,13 @@ def parse_tender(tender: dict) -> dict:
             ))
 
     awards = []
+    supplier_by_award: dict[str, tuple[str, str]] = {}
     for award in (tender.get("awards") or []):
         if not isinstance(award, dict):
             continue
         name, edrpou, _ = _first_org(award, "suppliers")
+        if award.get("id"):
+            supplier_by_award[award["id"]] = (name, edrpou)
         awards.append((
             award.get("id"), uuid, award.get("lotID"), award.get("status"), award.get("date"),
             _num((award.get("value") or {}).get("amount")),
@@ -199,6 +202,12 @@ def parse_tender(tender: dict) -> dict:
         if not isinstance(contract, dict):
             continue
         name, edrpou, _ = _first_org(contract, "suppliers")
+        if not edrpou:
+            # У картці закупівлі `contracts[].suppliers` майже завжди порожній —
+            # постачальник вказаний у рішенні про переможця, на яке договір
+            # посилається через `awardID`. Без цієї підстановки вся аналітика
+            # «хто продав і на яку суму» лишається без ЄДРПОУ.
+            name, edrpou = supplier_by_award.get(contract.get("awardID"), (name, edrpou))
         contracts.append((
             contract.get("id"), uuid, contract.get("contractID"), contract.get("status"),
             contract.get("dateSigned") or contract.get("date"),

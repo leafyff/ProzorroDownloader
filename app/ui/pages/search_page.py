@@ -113,21 +113,52 @@ class SearchPage(QWidget):
         refine.add(amount_row)
         lay.addWidget(refine)
 
-        files = Card("Що завантажувати", "Позначте, файли яких розділів картки потрібні.")
+        files = Card("Що завантажувати")
+        self.mode = QComboBox()
+        self.mode.addItem("Тільки дані для аналітики — без файлів", False)
+        self.mode.addItem("Дані та файли закупівель", True)
+        self.mode.currentIndexChanged.connect(self._mode_changed)
+        files.add(self.mode)
+        self.mode_hint = wrapped_label("")
+        files.add(self.mode_hint)
+
+        self.collect_market = QCheckBox("Додати картки товарів з е-каталогу Prozorro Market")
+        self.collect_market.setToolTip(
+            "Єдине джерело технічних характеристик, фото, штрихкодів і цінових "
+            "діапазонів. Береться за тим самим класом ДК021, що й закупівлі.")
+        files.add(self.collect_market)
+        self.market_active_only = QCheckBox("     лише чинні картки товарів")
+        self.market_active_only.setToolTip(
+            "Прострочені картки описують пропозицію, якої вже немає на ринку. "
+            "Разом із ними класу вдвічі більше.")
+        files.add(self.market_active_only)
+        files.add(wrapped_label(
+            "Каталог дає бренд і модель, ~30 технічних параметрів на товар, "
+            "гарантійний термін, фото та квартилі ціни. Перший збір класу триває "
+            "довго, надалі оновлюються лише змінені картки."))
+        self.collect_market.toggled.connect(self.market_active_only.setEnabled)
+
+        self.files_box = QWidget()
+        files_lay = QVBoxLayout(self.files_box)
+        files_lay.setContentsMargins(0, 0, 0, 0)
+        files_lay.setSpacing(10)
+        files.add(self.files_box)
+
         self.scopes = CheckGrid(DOC_SCOPES, columns=1)
-        files.add(self.scopes)
+        files_lay.addWidget(self.scopes)
 
         self.skip_signatures = QCheckBox("Пропускати файли електронного підпису (.p7s)")
         self.skip_signatures.setToolTip(
             "Відокремлені підписи КЕП не містять змісту, але це близько третини "
             "файлів закупівлі та п'ята частина обсягу.")
-        files.add(self.skip_signatures)
+        files_lay.addWidget(self.skip_signatures)
 
-        files.add(QLabel("Лише ці типи файлів (через кому, порожньо — усі)",
-                         objectName="Muted"))
+        ext_label = QLabel("Лише ці типи файлів (через кому, порожньо — усі)")
+        ext_label.setObjectName("Muted")
+        files_lay.addWidget(ext_label)
         self.extensions = QLineEdit()
         self.extensions.setPlaceholderText("напр. pdf, docx")
-        files.add(self.extensions)
+        files_lay.addWidget(self.extensions)
 
         ext_row = QHBoxLayout()
         ext_row.setSpacing(4)
@@ -146,7 +177,7 @@ class SearchPage(QWidget):
             btn.clicked.connect(lambda _=False, v=value: self.extensions.setText(", ".join(v)))
             ext_row.addWidget(btn)
         ext_row.addStretch(1)
-        files.add(ext_row)
+        files_lay.addLayout(ext_row)
         lay.addWidget(files)
 
         lay.addStretch(1)
@@ -209,6 +240,17 @@ class SearchPage(QWidget):
         card.add(buttons)
         return card
 
+    def _mode_changed(self) -> None:
+        with_files = bool(self.mode.currentData())
+        self.files_box.setVisible(with_files)
+        self.mode_hint.setText(
+            "Замовник, постачальник, суми, коди ДК021 та учасники беруться з картки "
+            "закупівлі — файли для цього не потрібні. Так пошук іде в рази швидше."
+            if not with_files else
+            "Додатково качаються документи: технічні вимоги, специфікації, договори. "
+            "Це десятки-сотні мегабайт на сотню закупівель.")
+        self.btn_start.setText("Зібрати дані" if not with_files else "Завантажити все")
+
     # --- обмін з налаштуваннями ------------------------------------------
 
     def load_preset(self, preset: SearchPreset) -> None:
@@ -227,6 +269,11 @@ class SearchPage(QWidget):
         self.value_max.set_value(preset.value_max)
         self.skip_signatures.setChecked(preset.skip_signatures)
         self.extensions.setText(", ".join(preset.only_extensions or []))
+        self.mode.setCurrentIndex(1 if preset.download_files else 0)
+        self.collect_market.setChecked(preset.collect_market)
+        self.market_active_only.setChecked(preset.market_active_only)
+        self.market_active_only.setEnabled(preset.collect_market)
+        self._mode_changed()
 
     def to_preset(self) -> SearchPreset:
         self.dates.normalize()
@@ -255,7 +302,9 @@ class SearchPage(QWidget):
             only_extensions=[e.strip().lstrip(".").lower()
                              for e in self.extensions.text().replace(";", ",").split(",")
                              if e.strip()],
-            download_files=True,
+            download_files=bool(self.mode.currentData()),
+            collect_market=self.collect_market.isChecked(),
+            market_active_only=self.market_active_only.isChecked(),
         )
 
     # --- стан під час роботи ---------------------------------------------

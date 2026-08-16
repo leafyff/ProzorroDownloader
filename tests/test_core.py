@@ -20,6 +20,7 @@ from app.core.downloader import (
     FileDownloader, document_extension, is_signature, normalize_extensions, tender_folder,
 )
 from app.core.extract import iter_documents, latest_versions, parse_tender
+from app.core.market import class_codes, parse_product
 from app.core.pipeline import Pipeline
 from app.core.resolver import IndexBuilder, tender_id_of
 from app.paths import safe_name
@@ -96,6 +97,27 @@ def test_extract() -> None:
     versions = latest_versions([dict(d) for d in docs])
     check("лишається остання версія", len(versions) == 4, len(versions))
 
+    # У картці закупівлі постачальник указаний лише в рішенні про переможця,
+    # а договір посилається на нього через awardID.
+    with_contract = {
+        "id": "t2", "tenderID": "UA-2026-01-01-000002-a",
+        "awards": [{"id": "aw1", "status": "active",
+                    "suppliers": [{"name": "ТОВ Постачальник",
+                                   "identifier": {"id": "12345678"}}]}],
+        "contracts": [{"id": "c1", "contractID": "UA-2026-01-01-000002-a-a1",
+                       "awardID": "aw1", "status": "active",
+                       "value": {"amount": 1000, "currency": "UAH"}}],
+    }
+    parsed = parse_tender(with_contract)
+    contract = parsed["contracts"][0]
+    check("ЄДРПОУ постачальника підтягнуто з нагороди", contract[8] == "12345678", contract[8])
+    check("назву постачальника теж підтягнуто", contract[7] == "ТОВ Постачальник")
+    # Якщо постачальник таки вказаний у самому договорі — беремо саме його.
+    with_contract["contracts"][0]["suppliers"] = [
+        {"name": "ТОВ Інший", "identifier": {"id": "87654321"}}]
+    check("власний постачальник договору має пріоритет",
+          parse_tender(with_contract)["contracts"][0][8] == "87654321")
+
 
 def test_index_chunks() -> None:
     print("\n=== межі відрізків індексу ===")
@@ -109,6 +131,57 @@ def test_index_chunks() -> None:
           tender_id_of("UA-2026-08-13-007779-a-a1") == "UA-2026-08-13-007779-a")
     check("номер без суфікса не змінюється",
           tender_id_of("UA-2026-08-13-007779-a") == "UA-2026-08-13-007779-a")
+
+
+def test_market() -> None:
+    print("\n=== картки товарів е-каталогу ===")
+    # Каталог класифікує товари на рівні класу, закупівлі — на рівні коду.
+    check("коди підіймаються до класу",
+          class_codes(["30213300-8", "30213100-6"]) == ["30210000-4"],
+          class_codes(["30213300-8", "30213100-6"]))
+    check("порожній перелік", class_codes([]) == [])
+    check("сміття не ламає", class_codes(["", "12", None]) == [])
+
+    card = {
+        "id": "p1", "status": "active",
+        "title": "Ноутбук Acer TravelMate TMP215-55",
+        "description": "Ноутбук 15.6\" FHD IPS",
+        "categoryTitle": "Ноутбуки",
+        "owner": "uss.gov.ua",
+        "images": ["https://x/1.png", "https://x/2.png"],
+        "identifier": {"id": "4711474580108", "scheme": "EAN-13"},
+        "classification": {"scheme": "ДК021",
+                           "description": "ДК 021:2015: 30210000-4 — Машини для обробки даних"},
+        "latestPrice": {"lowerQuartile": 38235, "upperQuartile": 42900,
+                        "currency": "UAH", "valueAddedTaxIncluded": False,
+                        "date": "2026-02-10T10:00:04+02:00"},
+        "requirementResponses": [
+            {"requirement": "Бренд", "values": ["ACER"], "unitName": ""},
+            {"requirement": "Діагональ екрану", "values": [15.6], "unitName": "дюйм"},
+            {"requirement": "Мова розкладки", "values": ["англійська", "українська"],
+             "unitName": ""},
+            {"requirement": "Сенсорний екран", "values": [False], "unitName": ""},
+        ],
+    }
+    row, specs = parse_product(card)
+    check("бренд витягнуто з характеристик", row["brand"] == "ACER", row["brand"])
+    check("штрихкод", row["barcode"] == "4711474580108")
+    check("код ДК021 з опису класифікації", row["cpv"] == "30210000-4", row["cpv"])
+    check("ціновий діапазон", (row["price_low"], row["price_high"]) == (38235.0, 42900.0))
+    check("фото полічені", row["n_images"] == 2)
+    check("характеристики полічені", row["n_specs"] == 4)
+    check("довжина опису", row["description_len"] == len(card["description"]))
+    check("характеристик у довгому форматі", len(specs) == 4)
+    numeric = next(s for s in specs if s[1] == "Діагональ екрану")
+    check("числове значення окремо", numeric[3] == 15.6 and numeric[4] == "дюйм")
+    multi = next(s for s in specs if s[1] == "Мова розкладки")
+    check("кілька значень через кому", multi[2] == "англійська, українська", multi[2])
+    check("логічне значення як текст",
+          next(s for s in specs if s[1] == "Сенсорний екран")[2] == "False")
+    # Стисла картка з пошуку доповнює детальну, якщо в тій чогось бракує.
+    row2, _ = parse_product({"id": "p2"}, {"title": "З пошуку", "status": "inactive"})
+    check("дані з пошуку підставляються",
+          row2["title"] == "З пошуку" and row2["status"] == "inactive")
 
 
 def test_paths(tmp: Path) -> None:
@@ -221,13 +294,46 @@ def test_widgets() -> None:
     app.processEvents()
 
 
-def test_empty_retry(tmp: Path) -> None:
-    print("\n=== повтор без невдалих файлів ===")
+def test_download_missing(tmp: Path) -> None:
+    print("\n=== довантаження відсутніх файлів ===")
     db = Database(tmp / "retry.db")
     settings = Settings()
     settings.output_dir = str(tmp / "out")
-    result = Pipeline(settings, SearchPreset(), db).retry_failed()
-    check("не падає й нічого не качає", result.files_ok == 0 and not result.error, result.error)
+
+    result = Pipeline(settings, SearchPreset(), db).download_missing()
+    check("порожня база не падає", result.files_ok == 0 and not result.error, result.error)
+
+    # Документи, зафіксовані під час збору без файлів, мають потрапляти в чергу.
+    tender = {"id": "t3", "tenderID": "UA-2026-01-01-000003-a",
+              "documents": [
+                  {"id": "d1", "url": "https://x/1", "title": "умови.pdf",
+                   "format": "application/pdf"},
+                  {"id": "d2", "url": "https://x/2", "title": "sign.p7s",
+                   "format": "application/pkcs7-signature"}]}
+    parsed = parse_tender(tender)
+    db.save_tender(parsed["row"], lots=[], items=[], bids=[], awards=[],
+                   contracts=[], docs=parsed["docs"])
+    queued = db.query("SELECT state, COUNT(*) n FROM documents GROUP BY state")
+    check("документи лягли в чергу", [dict(r) for r in queued] == [{"state": "pending", "n": 2}],
+          [dict(r) for r in queued])
+
+    preset = SearchPreset()
+    preset.skip_signatures = True
+    pipeline = Pipeline(settings, preset, db)
+    # Мережу не чіпаємо: перевіряємо лише те, що з черги береться в роботу.
+    selected = pipeline._apply_file_filter(
+        [dict(r) for r in db.pending_documents()])
+    check("підпис відсіяно, документ лишився",
+          [d["title"] for d in selected] == ["умови.pdf"], [d["title"] for d in selected])
+    states = {r["state"]: r["n"] for r in
+              db.query("SELECT state, COUNT(*) n FROM documents GROUP BY state")}
+    check("підпис позначено відсіяним", states.get("filtered") == 1, states)
+
+    # Відсіяне має повертатися в чергу, якщо фільтр вимкнули.
+    preset.skip_signatures = False
+    again = Pipeline(settings, preset, db)._apply_file_filter(
+        [dict(r) for r in db.pending_documents()])
+    check("після вимкнення фільтра підпис знову в черзі", len(again) == 2, len(again))
     db.close()
 
 
@@ -240,8 +346,9 @@ def main() -> int:
         test_extract()
         test_index_chunks()
         test_file_filter()
+        test_market()
         test_paths(tmp)
-        test_empty_retry(tmp)
+        test_download_missing(tmp)
         test_widgets()
     if FAILED:
         print(f"\nНЕ ПРОЙШЛО {len(FAILED)}: {', '.join(FAILED)}")

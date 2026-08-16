@@ -122,8 +122,8 @@ class CountWorker(QThread):
             self.bridge.finished.emit(cards)
 
 
-class RetryWorker(QThread):
-    """Повторне завантаження файлів, які раніше не вдалося взяти."""
+class MissingFilesWorker(QThread):
+    """Довантаження файлів, яких ще немає на диску."""
 
     def __init__(self, settings: Settings, db: Database, parent=None):
         super().__init__(parent)
@@ -161,7 +161,7 @@ class RetryWorker(QThread):
                 on_stats=lambda s: self.bridge.stats.emit(s),
                 cancel_event=self.cancel_event,
             )
-            result = pipeline.retry_failed()
+            result = pipeline.download_missing()
         except Exception as exc:
             self.bridge.log.emit("error", f"Несподівана помилка: {exc}")
         finally:

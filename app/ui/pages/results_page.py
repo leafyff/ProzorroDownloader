@@ -1,19 +1,22 @@
 """Сторінка «Результати»: таблиця знайдених закупівель і вивантаження у Excel."""
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 
 from PySide6.QtCore import (
     QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt, QTimer,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemView, QFileDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMessageBox, QPushButton, QTableView, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
+    QLineEdit, QMessageBox, QPushButton, QTableView, QVBoxLayout, QWidget,
 )
 
 from ...config import METHOD_LABELS, STATUS_LABELS
+from ...core.analytics import build_sheets as build_summary_sheets
 from ...core.db import Database
 from ...core.exporter import write_xlsx
+from ...core.rawexport import build_sheets as build_raw_sheets
 
 COLUMNS = [
     ("tender_id", "Номер закупівлі", 175),
@@ -143,8 +146,16 @@ class ResultsPage(QWidget):
         refresh = QPushButton("Оновити")
         refresh.clicked.connect(self.reload)
         tools.addWidget(refresh)
-        export = QPushButton("Вивантажити в Excel")
+        summary_btn = QPushButton("Зведення")
+        summary_btn.setToolTip("Підсумкові зрізи: рейтинги постачальників, замовників, "
+                               "галузей і динаміка по місяцях")
+        summary_btn.clicked.connect(self.export_summary)
+        tools.addWidget(summary_btn)
+
+        export = QPushButton("Вивантажити всі дані")
         export.setObjectName("Primary")
+        export.setToolTip("Один файл із сирими даними: закупівлі, лоти, номенклатура, "
+                          "пропозиції, договори, документи та картки товарів каталогу")
         export.clicked.connect(self.export)
         tools.addWidget(export)
         root.addLayout(tools)
@@ -217,23 +228,35 @@ class ResultsPage(QWidget):
     # --- вивантаження -----------------------------------------------------
 
     def export(self) -> None:
+        """Повне вивантаження сирих даних — без підсумків і рейтингів."""
+        self._save(build_raw_sheets, "prozorro-дані", "Усі дані")
+
+    def export_summary(self) -> None:
+        """Підсумкові зрізи — окремо, якщо потрібні готові рейтинги."""
+        self._save(build_summary_sheets, "prozorro-зведення", "Зведення")
+
+    def _save(self, builder, stem: str, title: str) -> None:
         if not self.model.rows:
-            QMessageBox.information(self, "Немає даних", "Спочатку завантажте закупівлі.")
+            QMessageBox.information(self, "Немає даних", "Спочатку зберіть дані закупівель.")
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Зберегти звіт", str(Path.home() / "prozorro-звіт.xlsx"),
+            self, f"Зберегти: {title}",
+            str(Path.home() / f"{stem}-{date.today():%Y-%m-%d}.xlsx"),
             "Книга Excel (*.xlsx)")
         if not path:
             return
-        headers = [label for _key, label, _w in COLUMNS]
-        rows = [[_export_value(key, r.get(key)) for key, _l, _w in COLUMNS]
-                for r in self.model.rows]
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            write_xlsx(Path(path), {"Закупівлі": (headers, rows)})
+            sheets = builder(self.db)
+            write_xlsx(Path(path), sheets)
         except Exception as exc:
             QMessageBox.critical(self, "Помилка", f"Не вдалося зберегти файл:\n{exc}")
             return
-        QMessageBox.information(self, "Готово", f"Звіт збережено:\n{path}")
+        finally:
+            QApplication.restoreOverrideCursor()
+        listing = "\n".join(f"  · {name} — {len(rows):,} рядків".replace(",", " ")
+                            for name, (_h, rows) in sheets.items())
+        QMessageBox.information(self, "Готово", f"Збережено:\n{path}\n\n{listing}")
 
 
 def _export_value(key: str, value):

@@ -114,7 +114,7 @@ def _human(size) -> str:
 
 
 class FilesPage(QWidget):
-    retry_failed = Signal()
+    download_missing = Signal()
 
     def __init__(self, db: Database, get_output_dir, parent=None):
         super().__init__(parent)
@@ -150,9 +150,11 @@ class FilesPage(QWidget):
         refresh = QPushButton("Оновити")
         refresh.clicked.connect(self.reload)
         tools.addWidget(refresh)
-        self.btn_retry = QPushButton("Повторити невдалі")
-        self.btn_retry.setToolTip("Завантажити ще раз лише ті файли, які не вдалося взяти")
-        self.btn_retry.clicked.connect(self.retry_failed.emit)
+        self.btn_retry = QPushButton("Завантажити відсутні")
+        self.btn_retry.setToolTip(
+            "Взяти всі файли, яких ще немає на диску: і ті, що не долетіли, і ті, "
+            "що лише зафіксовані в базі після збору без файлів")
+        self.btn_retry.clicked.connect(self.download_missing.emit)
         tools.addWidget(self.btn_retry)
         open_dir = QPushButton("Відкрити теку")
         open_dir.setObjectName("Primary")

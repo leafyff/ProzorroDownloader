@@ -28,6 +28,13 @@ def write_xlsx(path: Path, sheets: dict[str, tuple[Sequence[str], Sequence[Seque
             cell.alignment = Alignment(vertical="center", wrap_text=True)
         for row in rows:
             ws.append(list(row))
+        # Грошові й лічильні колонки — з розрядами, щоб суми читалися очима.
+        for line in ws.iter_rows(min_row=2):
+            for cell in line:
+                if isinstance(cell.value, float):
+                    cell.number_format = "#,##0.00"
+                elif isinstance(cell.value, int) and not isinstance(cell.value, bool):
+                    cell.number_format = "#,##0"
         widths = [len(str(h)) for h in headers]
         for row in rows[:400]:
             for i, value in enumerate(row):

@@ -42,6 +42,9 @@ class Resolver:
         self.search = SearchApi(client)
         self.cdb = CdbApi(client)
         self.concurrency = max(1, concurrency)
+        #: Запити до пошукового порталу йдуть меншим числом потоків: темп однаково
+        #: обмежує сервер, а сплеск паралельних запитів лише ловить 429.
+        self.search_concurrency = max(1, min(3, concurrency))
         self._log = on_log or (lambda level, msg: None)
         self._lock = threading.Lock()
 
@@ -106,7 +109,7 @@ class Resolver:
                 self._log("warn", f"{tid}: пошук договору не вдався — {exc}")
             return None
 
-        with ThreadPoolExecutor(self.concurrency) as pool:
+        with ThreadPoolExecutor(self.search_concurrency) as pool:
             futures = [pool.submit(worker, tid) for tid in ids]
             for future in as_completed(futures):
                 done += 1

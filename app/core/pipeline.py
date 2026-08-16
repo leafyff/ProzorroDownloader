@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -11,7 +12,7 @@ from typing import Any, Callable
 
 from ..config import Settings, SearchPreset
 from ..paths import long_path
-from .api import SEARCH_MAX_RESULTS, CdbApi, SearchApi
+from .api import SEARCH_MAX_RESULTS, SEARCH_PAGE_SIZE, CdbApi, SearchApi
 from .classifiers import expand_prefixes
 from .db import Database
 from .downloader import (
@@ -19,6 +20,7 @@ from .downloader import (
 )
 from .extract import latest_versions, parse_tender
 from .http import Cancelled, HttpClient
+from .market import MarketApi, class_codes, parse_product
 from .resolver import IndexBuilder, Resolver, tender_id_of
 
 LogCb = Callable[[str, str], None]
@@ -40,6 +42,7 @@ class JobResult:
     files_skipped: int = 0
     files_failed: int = 0
     files_filtered: int = 0        # відсіяно фільтром типів (підписи тощо)
+    products: int = 0              # карток товарів е-каталогу
     bytes: int = 0
     cancelled: bool = False
     error: str = ""
@@ -74,6 +77,7 @@ class Pipeline:
         )
         self.search = SearchApi(self.client)
         self.cdb = CdbApi(self.client)
+        self.market = MarketApi(self.client)
         self.resolver = Resolver(self.client, db, concurrency=settings.detail_concurrency,
                                  on_log=self._log)
         self.result = JobResult()
@@ -199,10 +203,17 @@ class Pipeline:
 
         if missing and self.s.resolve_mode in ("auto", "contracts"):
             codes = self._cpv_codes()
-            if codes and len(missing) > 200:
+            # Гуртовий збір коштує один запит на двадцять закупівель, точковий —
+            # один на кожну, а портал обмежує темп до одиниць запитів на секунду.
+            # Тому щойно закупівель більше, ніж записів на сторінці, йдемо гуртом.
+            harvested = bool(codes) and len(missing) > SEARCH_PAGE_SIZE
+            if harvested:
                 mapping.update(self._harvest_contracts(set(missing), codes))
                 missing = [t for t in tender_ids if t not in mapping]
-            if missing:
+            elif missing:
+                # Точково має сенс лише тоді, коли гуртом було нічим: без коду
+                # ДК021 (наприклад, пошук суто за ЄДРПОУ конкурента). Після
+                # гуртового проходу той самий індекс договорів уже переглянуто.
                 mapping.update(self.resolver.from_contracts_search(missing, self._progress))
                 missing = [t for t in tender_ids if t not in mapping]
 
@@ -221,9 +232,12 @@ class Pipeline:
         self.result.resolved = len(mapping)
         self.result.unresolved = missing
         if missing:
-            self._log("warn", f"Не вдалося визначити UUID для {len(missing)} закупівель "
-                              f"(зазвичай це закупівлі без договору). "
-                              f"Увімкніть режим «повний індекс» у налаштуваннях для 100% покриття.")
+            self._log("warn",
+                      f"Розпізнано {len(mapping)} із {len(tender_ids)} закупівель. "
+                      f"Решта {len(missing)} — це ті, за якими ще немає договору: "
+                      f"звіти без вкладень, скасовані та ті, що тривають. "
+                      f"Щоб охопити і їх, побудуйте локальний індекс у налаштуваннях — "
+                      f"він працює через Центральну базу, де немає обмеження темпу.")
         self._tick()
         return mapping
 
@@ -301,7 +315,9 @@ class Pipeline:
                 bids=parsed["bids"], awards=parsed["awards"],
                 contracts=parsed["contracts"], docs=parsed["docs"],
             )
-            if self.s.save_tender_json:
+            # У режимі «тільки дані» на диску не з'являється нічого: тека з
+            # самою лише карткою — це шум, а самі дані вже в базі.
+            if self.s.save_tender_json and self.p.download_files:
                 row = parsed["row"]
                 _write_json(tender_folder(root, row["tender_id"], row["title"],
                                           row["date_created"]), tender_id, data)
@@ -392,10 +408,16 @@ class Pipeline:
             self.result.files_filtered = len(signatures) + len(other)
         return keep
 
-    def retry_failed(self) -> JobResult:
-        """Повторює завантаження лише тих файлів, які раніше не вдалося взяти."""
+    def download_missing(self) -> JobResult:
+        """Довантажує все, чого ще немає на диску.
+
+        Сюди потрапляють і файли, що не долетіли, і ті, які лише зафіксовані в
+        базі: у режимі «тільки дані» документи зберігаються з позначкою «у
+        черзі», і без цього кроку взяти їх було б нічим. Відсіяні фільтром
+        типів проходять повторний відбір, тож підписи КЕП і далі не качаються.
+        """
         docs = [dict(r) for r in self.db.query(
-            "SELECT * FROM documents WHERE state = 'error'")]
+            "SELECT * FROM documents WHERE state IN ('pending', 'error', 'filtered')")]
         try:
             self._download(self._apply_file_filter(docs))
         except Cancelled:
@@ -456,6 +478,80 @@ class Pipeline:
                           f"з помилками {dl.failed}, обсяг {dl.bytes / 1048576:.1f} МБ.")
         self._tick()
 
+    # --- крок 5: картки товарів е-каталогу --------------------------------
+
+    def collect_products(self) -> int:
+        """Тягне картки товарів каталогу за тими самими класами ДК021.
+
+        Каталог класифікує товари на рівні класу, тож обрані коди підіймаються
+        до нього. Уже відомі й незмінені картки не перечитуються.
+        """
+        codes = class_codes(self._cpv_codes())
+        if not codes:
+            self._log("info", "Клас ДК021 не задано — картки товарів пропускаємо.")
+            return 0
+        self._log("info", f"Каталог товарів: класи {', '.join(codes)}.")
+
+        brief: dict[str, dict] = {}
+        for code in codes:
+            try:
+                for page, total, rows in self.market.search(cpv=[code]):
+                    for row in rows:
+                        if row.get("id"):
+                            brief[row["id"]] = row
+                    self._progress(f"Каталог товарів ({code})", len(brief), total or len(brief))
+            except Cancelled:
+                raise
+            except Exception as exc:
+                self._log("warn", f"Каталог {code}: {exc}")
+
+        statuses = Counter((row.get("status") or "—") for row in brief.values())
+        self._log("info", "Стан карток: " + ", ".join(
+            f"{name} — {n}" for name, n in statuses.most_common()))
+
+        # Фільтр застосовуємо лише якщо чинні картки справді є: інакше назва
+        # статусу могла змінитися на боці каталогу, і ми б лишились ні з чим.
+        if self.p.market_active_only and statuses.get("active"):
+            before = len(brief)
+            brief = {pid: row for pid, row in brief.items() if row.get("status") == "active"}
+            self._log("info", f"Беремо лише чинні картки: {len(brief):,} із {before:,}"
+                      .replace(",", " "))
+
+        known = self.db.known_products()
+        todo = [pid for pid, row in brief.items()
+                if known.get(pid) != (row.get("dateModified") or "")[:10]]
+        skipped = len(brief) - len(todo)
+        self._log("info", f"До читання карток: {len(todo):,}"
+                          f"{f'; без змін: {skipped:,}' if skipped else ''}"
+                  .replace(",", " "))
+
+        done = 0
+        saved = 0
+        for pid in todo:
+            self.client.check_cancel()
+            try:
+                card = self.market.product(pid)
+            except Cancelled:
+                raise
+            except Exception as exc:
+                self._log("warn", f"Картка {pid[:8]}…: {exc}")
+                done += 1
+                continue
+            row, specs = parse_product(card, brief.get(pid))
+            row["fetched_at"] = datetime.now().isoformat(timespec="seconds")
+            self.db.save_product(row, specs)
+            saved += 1
+            done += 1
+            self._progress("Картки товарів", done, len(todo))
+            if done % 20 == 0:
+                self._tick()
+        self.result.products = saved + skipped
+        self._log("info", f"Картки товарів: збережено {saved:,}, усього в базі "
+                          f"{self.db.scalar('SELECT COUNT(*) FROM products') or 0:,}"
+                  .replace(",", " "))
+        self._tick()
+        return saved
+
     # --- запуск -----------------------------------------------------------
 
     def run(self) -> JobResult:
@@ -472,6 +568,8 @@ class Pipeline:
             rows = self.load_tenders(mapping)
             if self.p.download_files and rows:
                 self.download_files([row["uuid"] for row in rows])
+            if self.p.collect_market:
+                self.collect_products()
             self._log("info", "Готово.")
         except Cancelled:
             status = "cancelled"

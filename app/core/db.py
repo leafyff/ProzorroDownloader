@@ -161,6 +161,49 @@ CREATE INDEX IF NOT EXISTS ix_docs_tender ON documents(tender_uuid);
 CREATE INDEX IF NOT EXISTS ix_docs_state ON documents(state);
 CREATE INDEX IF NOT EXISTS ix_docs_hash ON documents(hash);
 
+-- Картки товарів електронного каталогу Prozorro Market.
+CREATE TABLE IF NOT EXISTS products (
+    id              TEXT PRIMARY KEY,
+    title           TEXT,
+    brand           TEXT,
+    description     TEXT,
+    category        TEXT,
+    cpv             TEXT,
+    cpv_name        TEXT,
+    barcode         TEXT,
+    barcode_scheme  TEXT,
+    status          TEXT,
+    marketplace     TEXT,
+    vendor          TEXT,
+    price_low       REAL,
+    price_high      REAL,
+    price_currency  TEXT,
+    price_vat       INTEGER,
+    price_date      TEXT,
+    n_images        INTEGER,
+    images          TEXT,
+    n_specs         INTEGER,
+    description_len INTEGER,
+    date_created    TEXT,
+    date_modified   TEXT,
+    expiration_date TEXT,
+    url             TEXT,
+    fetched_at      TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_products_cpv ON products(cpv);
+CREATE INDEX IF NOT EXISTS ix_products_brand ON products(brand);
+
+-- Технічні характеристики товарів у довгому форматі.
+CREATE TABLE IF NOT EXISTS product_specs (
+    product_id TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    value      TEXT,
+    number     REAL,
+    unit       TEXT,
+    PRIMARY KEY (product_id, name)
+);
+CREATE INDEX IF NOT EXISTS ix_specs_name ON product_specs(name);
+
 -- Історія запусків.
 CREATE TABLE IF NOT EXISTS jobs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -329,6 +372,29 @@ class Database:
                     sql + f" AND tender_uuid IN ({','.join('?' * len(chunk))})", params + chunk)
             return rows
         return self.query(sql, params)
+
+    # --- каталог товарів --------------------------------------------------
+
+    def save_product(self, row: dict, specs: Sequence[Sequence]) -> None:
+        cols = list(row.keys())
+        marks = ",".join("?" * len(cols))
+        updates = ",".join(f"{c}=excluded.{c}" for c in cols if c != "id")
+        with self._lock:
+            self.conn.execute(
+                f"INSERT INTO products({','.join(cols)}) VALUES({marks})"
+                f" ON CONFLICT(id) DO UPDATE SET {updates}",
+                [row[c] for c in cols],
+            )
+            self.conn.execute("DELETE FROM product_specs WHERE product_id=?", (row["id"],))
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO product_specs(product_id,name,value,number,unit)"
+                " VALUES(?,?,?,?,?)", specs)
+            self.conn.commit()
+
+    def known_products(self) -> dict[str, str]:
+        """``{id товару: дата останньої зміни}`` — щоб не тягнути незмінене вдруге."""
+        return {r["id"]: (r["date_modified"] or "")
+                for r in self.query("SELECT id, date_modified FROM products")}
 
     # --- завдання ---------------------------------------------------------
 

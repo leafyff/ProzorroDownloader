@@ -19,7 +19,7 @@ from .pages.results_page import ResultsPage
 from .pages.search_page import SearchPage
 from .pages.settings_page import SettingsPage
 from .theme import palette, stylesheet
-from .workers import CountWorker, DownloadWorker, IndexWorker, RetryWorker
+from .workers import CountWorker, DownloadWorker, IndexWorker, MissingFilesWorker
 
 NAV = [
     ("Пошук і завантаження", "search"),
@@ -122,7 +122,7 @@ class MainWindow(QMainWindow):
         self.search_page.start_download.connect(self.start_download)
         self.search_page.start_count.connect(self.start_count)
         self.search_page.stop_requested.connect(self.stop_worker)
-        self.files_page.retry_failed.connect(self.start_retry)
+        self.files_page.download_missing.connect(self.start_missing_files)
         self.settings_page.build_index.connect(self.start_index)
         self.settings_page.stop_index.connect(self.stop_index)
         self.settings_page.settings_changed.connect(self.apply_theme)
@@ -186,21 +186,30 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Рахую…")
         worker.start()
 
-    def start_retry(self) -> None:
+    def start_missing_files(self) -> None:
         if self._busy():
             return
+        pending = self.db.scalar(
+            "SELECT COUNT(*) FROM documents WHERE state IN ('pending','filtered')") or 0
         failed = self.db.scalar("SELECT COUNT(*) FROM documents WHERE state='error'") or 0
-        if not failed:
-            QMessageBox.information(self, "Немає чого повторювати",
-                                    "Усі відомі файли вже завантажено.")
+        if not pending and not failed:
+            QMessageBox.information(self, "Нічого завантажувати",
+                                    "Усі відомі файли вже на диску.")
             return
+        parts = []
+        if pending:
+            parts.append(f"{pending} ще не завантажених")
+        if failed:
+            parts.append(f"{failed} із помилками")
         answer = QMessageBox.question(
-            self, "Повторити завантаження",
-            f"Спробувати ще раз завантажити {failed} файл(ів), які не вдалося взяти?")
+            self, "Завантажити файли",
+            f"Узяти {' та '.join(parts)}?\n\n"
+            f"Підписи КЕП і зайві типи файлів буде відсіяно за поточними "
+            f"налаштуваннями на сторінці пошуку.")
         if answer != QMessageBox.StandardButton.Yes:
             return
-        self.log_page.append("info", f"— Повтор {failed} невдалих файлів —")
-        worker = RetryWorker(self.s, self.db, self)
+        self.log_page.append("info", f"— Завантаження відсутніх файлів: {pending + failed} —")
+        worker = MissingFilesWorker(self.s, self.db, self)
         worker.log.connect(self.log_page.append)
         worker.progress.connect(self.search_page.set_progress)
         worker.stats.connect(self.search_page.set_stats)
@@ -228,13 +237,19 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Зупинено користувачем")
             return
         text = (f"Знайдено закупівель: {result.found}\n"
-                f"Завантажено карток: {result.tenders_loaded}\n"
-                f"Файлів збережено: {result.files_ok}"
-                f" (пропущено {result.files_skipped}, помилок {result.files_failed})\n"
-                f"Обсяг: {result.bytes / 1048576:.1f} МБ")
-        if result.files_filtered:
-            text += (f"\nВідсіяно фільтром типів файлів: {result.files_filtered}"
-                     f" (переважно підписи КЕП)")
+                f"Зібрано карток: {result.tenders_loaded}")
+        if self.s.preset.download_files:
+            text += (f"\nФайлів збережено: {result.files_ok}"
+                     f" (пропущено {result.files_skipped}, помилок {result.files_failed})\n"
+                     f"Обсяг: {result.bytes / 1048576:.1f} МБ")
+            if result.files_filtered:
+                text += (f"\nВідсіяно фільтром типів файлів: {result.files_filtered}"
+                         f" (переважно підписи КЕП)")
+        else:
+            text += "\nФайли не завантажувалися."
+        if result.products:
+            text += f"\nКарток товарів у каталозі: {result.products}"
+        text += ("\n\nВивантажити зібране: «Результати» → «Вивантажити всі дані».")
         if result.unresolved:
             text += (f"\n\nНе вдалося визначити ідентифікатор для {len(result.unresolved)} "
                      f"закупівель — здебільшого це ті, за якими ще немає договору. "
@@ -251,11 +266,12 @@ class MainWindow(QMainWindow):
         if result is None or result.cancelled:
             return
         left = self.db.scalar("SELECT COUNT(*) FROM documents WHERE state='error'") or 0
-        QMessageBox.information(
-            self, "Повтор завершено",
-            f"Дозавантажено файлів: {result.files_ok}"
-            f" (обсяг {result.bytes / 1048576:.1f} МБ).\n"
-            + (f"Не піддалися: {left}." if left else "Невдалих не лишилося."))
+        text = (f"Завантажено файлів: {result.files_ok}"
+                f" (обсяг {result.bytes / 1048576:.1f} МБ).")
+        if result.files_filtered:
+            text += f"\nВідсіяно фільтром типів: {result.files_filtered}."
+        text += f"\n{f'Не піддалися: {left}.' if left else 'Невдалих не лишилося.'}"
+        QMessageBox.information(self, "Завантаження завершено", text)
 
     def _count_finished(self, cards) -> None:
         self.search_page.set_running(False)

@@ -16,18 +16,34 @@ USER_AGENT = f"{APP_NAME.replace(' ', '')}/{APP_VERSION} (+open data client)"
 #: Коди, які має сенс повторити.
 RETRY_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 
+#: Пошуковий портал відповідає 429 із паузою в 15–50 секунд значно раніше за
+#: Центральну базу. Виміряно: близько двох запитів на секунду тримає стабільно,
+#: шість — ловить 429 одразу. Тому темп для нього рахуємо окремо.
+HOST_LIMITS = {"prozorro.gov.ua": 2.0}
+
 
 class Cancelled(Exception):
     """Користувач зупинив операцію."""
 
 
 class RateLimiter:
-    """Простий потокобезпечний обмежувач «не більше N запитів за секунду»."""
+    """Обмежувач темпу, який сам підлаштовується під сервер.
+
+    Prozorro не оголошує ліміт і обмежує радше квотою на вікно, ніж миттєвим
+    темпом, тож підібрана наперед константа однаково буде або надто повільною,
+    або ловитиме 429. Замість цього після кожної відмови інтервал зростає, а
+    за серії вдалих запитів поволі повертається до бажаного.
+    """
+
+    #: Повільніше за це не сповільнюємось навіть після серії відмов.
+    FLOOR_RPS = 0.4
 
     def __init__(self, rps: float):
-        self.min_interval = 1.0 / rps if rps and rps > 0 else 0.0
+        self.base_interval = 1.0 / rps if rps and rps > 0 else 0.0
+        self.min_interval = self.base_interval
         self._lock = threading.Lock()
         self._next_at = 0.0
+        self._ok_streak = 0
 
     def acquire(self) -> None:
         if self.min_interval <= 0:
@@ -39,6 +55,25 @@ class RateLimiter:
                 time.sleep(wait)
                 now = time.monotonic()
             self._next_at = max(now, self._next_at) + self.min_interval
+
+    def penalize(self) -> float:
+        """Сервер відмовив — розтягуємо інтервал. Повертає новий темп."""
+        if self.base_interval <= 0:
+            return 0.0
+        with self._lock:
+            self._ok_streak = 0
+            self.min_interval = min(self.min_interval * 1.7, 1.0 / self.FLOOR_RPS)
+            return 1.0 / self.min_interval
+
+    def reward(self) -> None:
+        """Запит пройшов — після довгої серії вдалих поволі прискорюємось."""
+        if self.base_interval <= 0 or self.min_interval <= self.base_interval:
+            return
+        with self._lock:
+            self._ok_streak += 1
+            if self._ok_streak >= 25:
+                self._ok_streak = 0
+                self.min_interval = max(self.base_interval, self.min_interval * 0.8)
 
 
 class Stats:
@@ -84,6 +119,11 @@ class HttpClient:
         self.timeout = timeout
         self.max_retries = max_retries
         self.limiter = RateLimiter(rps)
+        self._host_limiters = {
+            host: RateLimiter(min(limit, rps)) for host, limit in HOST_LIMITS.items()
+        }
+        self._throttle_lock = threading.Lock()
+        self._last_reported_rps = 0.0
         self.cancel_event = cancel_event or threading.Event()
         self.stats = Stats()
         self._on_log = on_log
@@ -128,9 +168,12 @@ class HttpClient:
     ) -> requests.Response:
         """Виконує запит із ретраями. Кидає requests.RequestException після вичерпання спроб."""
         last_exc: Exception | None = None
+        host_limiter = self._limiter_for(url)
         for attempt in range(self.max_retries + 1):
             self.check_cancel()
             self.limiter.acquire()
+            if host_limiter is not None:
+                host_limiter.acquire()
             self.check_cancel()
             try:
                 resp = self.session.request(
@@ -141,13 +184,18 @@ class HttpClient:
                     timeout=timeout or self.timeout,
                 )
                 self.stats.add(requests=1)
+                if resp.status_code == 429 and host_limiter is not None:
+                    self._note_throttle(host_limiter, url)
                 if resp.status_code in RETRY_CODES and attempt < self.max_retries:
                     delay = self._retry_delay(attempt, resp)
                     self.stats.add(retries=1)
-                    self.log("warn", f"HTTP {resp.status_code} — повтор через {delay:.1f} с: {url[:120]}")
+                    self.log("warn", f"HTTP {resp.status_code} — повтор через {delay:.1f} с: "
+                                     f"{url[:110]}")
                     resp.close()
                     self._sleep(delay)
                     continue
+                if resp.status_code < 400 and host_limiter is not None:
+                    host_limiter.reward()
                 return resp
             except (requests.Timeout, requests.ConnectionError, requests.exceptions.ChunkedEncodingError) as exc:
                 last_exc = exc
@@ -167,6 +215,22 @@ class HttpClient:
 
     def note_bytes(self, count: int) -> None:
         self.stats.add(nbytes=count)
+
+    def _note_throttle(self, limiter: RateLimiter, url: str) -> None:
+        """Сповільнюємось під сервер і повідомляємо про це лише при зміні темпу."""
+        rps = limiter.penalize()
+        with self._throttle_lock:
+            if abs(rps - self._last_reported_rps) < 0.05:
+                return
+            self._last_reported_rps = rps
+        self.log("warn", f"Сервер обмежує темп — знижую до {rps:.1f} запит(ів)/с "
+                         f"для {url.split('/')[2]}")
+
+    def _limiter_for(self, url: str) -> RateLimiter | None:
+        for host, limiter in self._host_limiters.items():
+            if host in url:
+                return limiter
+        return None
 
     def _retry_delay(self, attempt: int, resp: requests.Response | None) -> float:
         if resp is not None:

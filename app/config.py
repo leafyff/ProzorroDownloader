@@ -104,7 +104,15 @@ class SearchPreset:
     skip_signatures: bool = True
     #: Обмежити типи файлів (порожньо — усі, крім відсіяних вище).
     only_extensions: list[str] = field(default_factory=list)
-    download_files: bool = True
+    #: Типово збираємо лише дані: замовник, постачальник, суми та коди ДК021
+    #: лежать у картці закупівлі, і для аналітики файли не потрібні.
+    download_files: bool = False
+    #: Додатково тягнути картки товарів з е-каталогу Prozorro Market — це єдине
+    #: джерело технічних характеристик, фото та цінових діапазонів.
+    collect_market: bool = True
+    #: Брати лише чинні картки: за клас їх удвічі менше, а прострочені описують
+    #: пропозицію, якої вже немає на ринку.
+    market_active_only: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
