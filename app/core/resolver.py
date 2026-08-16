@@ -214,12 +214,13 @@ class IndexBuilder:
                             # Добу можна вважати покритою лише тоді, коли ми
                             # зберегли всі її записи: інакше наступний запуск
                             # пропустить її й не знайде інших закупівель.
-                            if self.keep_all:
-                                with self._lock:
+                            with self._lock:
+                                if self.keep_all:
                                     self.db.coverage_mark(last_day, 0, True)
-                            done_days += 1
+                                done_days += 1
+                                seen = done_days
                             if progress:
-                                progress(f"Індексація {last_day}", done_days, total_days)
+                                progress(f"Індексація {last_day}", seen, total_days)
                             last_day = modified
                     if len(batch) >= 20000:
                         self.db.index_put(batch)

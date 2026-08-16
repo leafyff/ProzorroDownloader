@@ -3,10 +3,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QProgressBar,
-    QPushButton, QScrollArea, QSpinBox, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
+    QMessageBox, QProgressBar, QPushButton, QScrollArea, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from ...config import Settings
@@ -234,9 +234,27 @@ class SettingsPage(QWidget):
         s.theme = self.theme.currentData() or "dark"
 
     def apply_and_save(self) -> None:
+        if not self._check_output_dir():
+            return
         self.apply()
         self.s.save()
         self.settings_changed.emit()
+        QMessageBox.information(self, "Збережено", "Налаштування збережено.")
+
+    def _check_output_dir(self) -> bool:
+        """Переконуємось, що тека для завантажень справді придатна для запису."""
+        path = Path(self.output_dir.text().strip() or self.s.output_dir)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".prozorro-write-test"
+            probe.write_text("", encoding="utf-8")
+            probe.unlink()
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "Тека недоступна",
+                f"Не вдалося писати в «{path}»:\n{exc}\n\nОберіть іншу теку.")
+            return False
+        return True
 
     def _reset(self) -> None:
         defaults = Settings()
@@ -256,13 +274,27 @@ class SettingsPage(QWidget):
 
     def _emit_build(self) -> None:
         self.apply()
+        self.index_dates.normalize()
         date_from, date_to = self.index_dates.values()
         self.build_index.emit(date_from, date_to)
 
     def _clear_index(self) -> None:
-        self.db.execute("DELETE FROM tender_index")
-        self.db.execute("DELETE FROM index_coverage")
-        self.db.execute("VACUUM")
+        size = self.db.index_size()
+        answer = QMessageBox.question(
+            self, "Очистити індекс",
+            f"Вилучити {size:,} записів індексу та стиснути файл бази?\n\n"
+            f"Завантажені картки закупівель і файли не постраждають, але "
+            f"індекс доведеться будувати наново. Стиснення великої бази може "
+            f"тривати кілька хвилин.".replace(",", " "))
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self.db.execute("DELETE FROM tender_index")
+            self.db.execute("DELETE FROM index_coverage")
+            self.db.execute("VACUUM")
+        finally:
+            QApplication.restoreOverrideCursor()
         self.refresh_index_info()
 
     def _theme_changed(self) -> None:

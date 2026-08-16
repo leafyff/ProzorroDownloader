@@ -99,6 +99,11 @@ class SearchPreset:
     value_min: float | None = None
     value_max: float | None = None
     doc_scopes: list[str] = field(default_factory=lambda: list(DOC_SCOPES.keys()))
+    #: Не качати відокремлені підписи КЕП (.p7s тощо) — вони не містять змісту
+    #: і в типовій закупівлі це близько третини файлів.
+    skip_signatures: bool = True
+    #: Обмежити типи файлів (порожньо — усі, крім відсіяних вище).
+    only_extensions: list[str] = field(default_factory=list)
     download_files: bool = True
 
     def to_dict(self) -> dict[str, Any]:
@@ -120,9 +125,10 @@ class Settings:
 
     search_concurrency: int = 6
     detail_concurrency: int = 8
-    #: Сервер документів Prozorro неохоче тримає багато одночасних з'єднань,
-    #: тож шість — практичний компроміс між швидкістю та кількістю повторів.
-    download_concurrency: int = 6
+    #: Сервер документів Prozorro віддає близько 30–40 КБ/с на потік, тож
+    #: паралельність тут прямо впливає на швидкість. Вище восьми віддача вже
+    #: не росте, а обривів стає помітно більше.
+    download_concurrency: int = 8
     index_concurrency: int = 4
     request_timeout: int = 60
     max_retries: int = 4

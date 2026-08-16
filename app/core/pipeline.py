@@ -14,7 +14,9 @@ from ..paths import long_path
 from .api import SEARCH_MAX_RESULTS, CdbApi, SearchApi
 from .classifiers import expand_prefixes
 from .db import Database
-from .downloader import FileDownloader, tender_folder
+from .downloader import (
+    FileDownloader, document_extension, is_signature, normalize_extensions, tender_folder,
+)
 from .extract import latest_versions, parse_tender
 from .http import Cancelled, HttpClient
 from .resolver import IndexBuilder, Resolver, tender_id_of
@@ -37,6 +39,7 @@ class JobResult:
     files_ok: int = 0
     files_skipped: int = 0
     files_failed: int = 0
+    files_filtered: int = 0        # відсіяно фільтром типів (підписи тощо)
     bytes: int = 0
     cancelled: bool = False
     error: str = ""
@@ -145,24 +148,27 @@ class Pipeline:
                 for page, total, rows in self.search.pages("tenders", **query):
                     if not rows:
                         break
-                    newest = max((self._card_date(r) for r in rows), default="")
-                    for row in rows:
+                    if page == 1 and total >= SEARCH_MAX_RESULTS:
+                        self._log("warn", f"За ДК021 {query.get('cpv')} пошук віддає щонайбільше "
+                                          f"10 000 записів. Якщо період довгий, частина закупівель "
+                                          f"може не потрапити — звузьте період або код.")
+                    dates = [self._card_date(row) for row in rows]
+                    newest = max((d for d in dates if d), default="")
+                    for row, published in zip(rows, dates):
                         tid = row.get("tenderID")
                         if not tid:
                             continue
-                        published = self._card_date(row)
                         if published and not (self._date_from <= published <= self._date_to):
                             continue
                         local[tid] = row
-                    if newest and newest < self._date_from:
+                    # Порожній `newest` означає, що дати визначити не вдалося:
+                    # гортати далі наосліп безглуздо, тож рахуємо це застарілим.
+                    if not newest or newest < self._date_from:
                         stale += 1
                         if stale >= STALE_PAGE_TOLERANCE:
                             break
                     else:
                         stale = 0
-                    if total >= SEARCH_MAX_RESULTS and page >= 500:
-                        self._log("warn", f"Досягнуто ліміт 10 000 записів для ДК021 "
-                                          f"{query.get('cpv')}. Звузьте період або код.")
             except Cancelled:
                 raise
             except Exception as exc:
@@ -237,12 +243,15 @@ class Pipeline:
                         break
                     newest = ""
                     for row in rows:
-                        signed = str(row.get("dateSigned") or "")[:10]
+                        contract_id = row.get("contractID") or ""
+                        # Дата підписання буває порожня — тоді орієнтуємось
+                        # на дату в номері закупівлі (UA-РРРР-ММ-ДД-…).
+                        signed = str(row.get("dateSigned") or "")[:10] or contract_id[3:13]
                         newest = max(newest, signed)
-                        tid = tender_id_of(row.get("contractID") or "")
+                        tid = tender_id_of(contract_id)
                         if tid in wanted and row.get("id"):
                             local[tid] = row["id"]
-                    if newest and newest < self._date_from:
+                    if not newest or newest < self._date_from:
                         stale += 1
                         if stale >= STALE_PAGE_TOLERANCE:
                             break
@@ -354,14 +363,41 @@ class Pipeline:
             for doc in docs:
                 per_tender.setdefault(doc["tender_uuid"], []).append(doc)
             docs = [d for group in per_tender.values() for d in latest_versions(group)]
-        self._download(docs)
+        self._download(self._apply_file_filter(docs))
+
+    def _apply_file_filter(self, docs: list[dict]) -> list[dict]:
+        """Відсіює підписи КЕП і зайві типи файлів, не викидаючи їх із бази."""
+        wanted = normalize_extensions(self.p.only_extensions)
+        if not self.p.skip_signatures and not wanted:
+            return docs
+
+        keep: list[dict] = []
+        signatures: list[str] = []
+        other: list[str] = []
+        for doc in docs:
+            if self.p.skip_signatures and is_signature(doc):
+                signatures.append(doc["key"])
+            elif wanted and document_extension(doc) not in wanted:
+                other.append(doc["key"])
+            else:
+                keep.append(doc)
+
+        if signatures:
+            self.db.mark_filtered(signatures, "файл електронного підпису")
+            self._log("info", f"Пропущено підписів КЕП: {len(signatures):,}".replace(",", " "))
+        if other:
+            self.db.mark_filtered(other, "тип файлу поза переліком")
+            self._log("info", f"Пропущено за типом файлу: {len(other):,}".replace(",", " "))
+        with self._lock:
+            self.result.files_filtered = len(signatures) + len(other)
+        return keep
 
     def retry_failed(self) -> JobResult:
         """Повторює завантаження лише тих файлів, які раніше не вдалося взяти."""
         docs = [dict(r) for r in self.db.query(
             "SELECT * FROM documents WHERE state = 'error'")]
         try:
-            self._download(docs)
+            self._download(self._apply_file_filter(docs))
         except Cancelled:
             self.result.cancelled = True
             self._log("warn", "Зупинено користувачем.")

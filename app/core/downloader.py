@@ -24,6 +24,27 @@ class TooLarge(Exception):
     """Файл більший за дозволений ліміт — повторювати немає сенсу."""
 
 
+#: Розширення відокремлених підписів КЕП. Самі по собі вони не містять
+#: жодного змісту — лише криптографічний підпис до сусіднього файлу.
+SIGNATURE_EXTENSIONS = {".p7s", ".p7b", ".p7m", ".sig", ".sign", ".cades", ".pkcs7"}
+
+#: MIME-типи тих самих підписів — надійніший спосіб, ніж назва файлу.
+SIGNATURE_FORMATS = {
+    "application/pkcs7-signature",
+    "application/x-pkcs7-signature",
+    "application/pkcs7-mime",
+    "application/x-pkcs7-mime",
+    "application/pkcs7",
+}
+
+#: Текстові документи — найцінніше в закупівлі.
+TEXT_EXTENSIONS = ["pdf", "docx", "doc", "rtf", "odt"]
+
+#: Те саме плюс таблиці й архіви. Архіви навмисно тут: учасники часто
+#: вантажать усю пропозицію одним zip/rar, і без них губиться змістовна частина
+#: (на перевіреному зрізі це 70 файлів і 210 МБ).
+DOCUMENT_EXTENSIONS = TEXT_EXTENSIONS + ["xlsx", "xls", "ods", "zip", "rar", "7z"]
+
 #: Розширення за MIME, якщо в назві файлу його немає.
 _EXTRA_MIME = {
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
@@ -101,15 +122,7 @@ class FileDownloader:
         return path
 
     def _file_name(self, doc: dict) -> str:
-        title = (doc.get("title") or "").strip() or (doc.get("doc_id") or "file")
-        name = safe_name(title, max_len=90)
-        if "." not in name[-6:]:
-            fmt = (doc.get("format") or "").lower()
-            ext = _EXTRA_MIME.get(fmt)
-            if ext is None:
-                ext = mimetypes.guess_extension(fmt) or ""
-            name += ext
-        return name
+        return file_name_for(doc)
 
     # --- завантаження -----------------------------------------------------
 
@@ -186,7 +199,7 @@ class FileDownloader:
         try:
             if resp.status_code >= 400:
                 raise IOError(f"HTTP {resp.status_code}")
-            declared = int(resp.headers.get("Content-Length") or 0)
+            declared = _int(resp.headers.get("Content-Length"))
             if self.max_bytes and declared > self.max_bytes:
                 raise TooLarge(f"файл {declared // 1048576} МБ перевищує ліміт")
 
@@ -205,6 +218,8 @@ class FileDownloader:
             except BaseException:
                 _unlink(tmp)
                 raise
+            # Недовантажений файл гірший за відсутній: краще позначити збій
+            # і перекачати, ніж лишити на диску обрізаний документ.
             if declared and written < declared:
                 _unlink(tmp)
                 raise IOError(f"отримано {written} з {declared} байтів")
@@ -223,6 +238,54 @@ def _unlink(path: Path) -> None:
         os.unlink(long_path(path))
     except OSError:
         pass
+
+
+def document_extension(doc: dict) -> str:
+    """Розширення документа в нижньому регістрі, з крапкою: ``.pdf``.
+
+    Береться з назви, а якщо її немає — визначається за MIME-типом,
+    тобто рівно так само, як формується ім'я файлу на диску.
+    """
+    name = file_name_for(doc)
+    _, dot, ext = name.rpartition(".")
+    return f".{ext.lower()}" if dot and len(ext) <= 8 else ""
+
+
+def is_signature(doc: dict) -> bool:
+    """Чи це відокремлений підпис КЕП, а не змістовний документ."""
+    if (doc.get("format") or "").strip().lower() in SIGNATURE_FORMATS:
+        return True
+    return document_extension(doc) in SIGNATURE_EXTENSIONS
+
+
+def file_name_for(doc: dict) -> str:
+    """Ім'я файлу на диску для документа (без розведення збігів)."""
+    title = (doc.get("title") or "").strip() or (doc.get("doc_id") or "file")
+    name = safe_name(title, max_len=90)
+    if "." not in name[-6:]:
+        fmt = (doc.get("format") or "").lower()
+        ext = _EXTRA_MIME.get(fmt)
+        if ext is None:
+            ext = mimetypes.guess_extension(fmt) or ""
+        name += ext
+    return name
+
+
+def normalize_extensions(values) -> set[str]:
+    """``['PDF', '.docx', ' xls ']`` → ``{'.pdf', '.docx', '.xls'}``."""
+    out: set[str] = set()
+    for value in values or []:
+        item = str(value).strip().lower().lstrip("*").lstrip(".")
+        if item:
+            out.add(f".{item}")
+    return out
+
+
+def _int(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _is_within(candidate: str, root: Path) -> bool:

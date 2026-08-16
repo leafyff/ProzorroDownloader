@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QComboBox, QDoubleSpinBox, QHBoxLayout, QLabel, QLineEdit, QProgressBar,
+    QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QProgressBar, QPushButton,
     QScrollArea, QSplitter, QVBoxLayout, QWidget,
 )
 
@@ -11,7 +11,10 @@ from ...config import (
     DOC_SCOPES, METHOD_HINTS, METHOD_LABELS, STATUS_LABELS, SearchPreset,
 )
 from ...core.classifiers import regions
-from ..widgets.common import Card, CheckGrid, DateRange, EdrpouList, StatTile, wrapped_label
+from ...core.downloader import DOCUMENT_EXTENSIONS, TEXT_EXTENSIONS
+from ..widgets.common import (
+    Card, CheckGrid, DateRange, EdrpouList, MoneyEdit, StatTile, wrapped_label,
+)
 from ..widgets.cpv_picker import CpvPicker
 
 
@@ -95,13 +98,16 @@ class SearchPage(QWidget):
         self.region.addItem("— будь-який —", "")
         for name in regions():
             self.region.addItem(name, name)
+        self.region.setToolTip(
+            "Регіон береться з адреси замовника. Частина замовників його не "
+            "заповнює — такі закупівлі до вибірки за регіоном не потраплять.")
         refine.add(self.region)
 
         refine.add(QLabel("Очікувана вартість, грн", objectName="Muted"))
         amount_row = QHBoxLayout()
         amount_row.setSpacing(8)
-        self.value_min = _money("від")
-        self.value_max = _money("до")
+        self.value_min = MoneyEdit("від")
+        self.value_max = MoneyEdit("до")
         amount_row.addWidget(self.value_min, 1)
         amount_row.addWidget(self.value_max, 1)
         refine.add(amount_row)
@@ -110,6 +116,37 @@ class SearchPage(QWidget):
         files = Card("Що завантажувати", "Позначте, файли яких розділів картки потрібні.")
         self.scopes = CheckGrid(DOC_SCOPES, columns=1)
         files.add(self.scopes)
+
+        self.skip_signatures = QCheckBox("Пропускати файли електронного підпису (.p7s)")
+        self.skip_signatures.setToolTip(
+            "Відокремлені підписи КЕП не містять змісту, але це близько третини "
+            "файлів закупівлі та п'ята частина обсягу.")
+        files.add(self.skip_signatures)
+
+        files.add(QLabel("Лише ці типи файлів (через кому, порожньо — усі)",
+                         objectName="Muted"))
+        self.extensions = QLineEdit()
+        self.extensions.setPlaceholderText("напр. pdf, docx")
+        files.add(self.extensions)
+
+        ext_row = QHBoxLayout()
+        ext_row.setSpacing(4)
+        for title, value, hint in (
+            ("PDF і Word", TEXT_EXTENSIONS,
+             "Лише текстові документи. Архіви буде пропущено, а в них часто "
+             "лежить уся пропозиція учасника."),
+            ("Документи й архіви", DOCUMENT_EXTENSIONS,
+             "Текст, таблиці та архіви (zip, rar, 7z) — рекомендовано"),
+            ("Усі типи", [], "Без обмеження за типом файлу"),
+        ):
+            btn = QPushButton(title)
+            btn.setObjectName("Link")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip(hint)
+            btn.clicked.connect(lambda _=False, v=value: self.extensions.setText(", ".join(v)))
+            ext_row.addWidget(btn)
+        ext_row.addStretch(1)
+        files.add(ext_row)
         lay.addWidget(files)
 
         lay.addStretch(1)
@@ -186,12 +223,20 @@ class SearchPage(QWidget):
         region = (preset.regions or [""])[0]
         index = self.region.findData(region)
         self.region.setCurrentIndex(max(0, index))
-        self.value_min.setValue(preset.value_min or 0)
-        self.value_max.setValue(preset.value_max or 0)
+        self.value_min.set_value(preset.value_min)
+        self.value_max.set_value(preset.value_max)
+        self.skip_signatures.setChecked(preset.skip_signatures)
+        self.extensions.setText(", ".join(preset.only_extensions or []))
 
     def to_preset(self) -> SearchPreset:
+        self.dates.normalize()
         date_from, date_to = self.dates.values()
         region = self.region.currentData() or ""
+        low, high = self.value_min.value(), self.value_max.value()
+        if low is not None and high is not None and low > high:
+            low, high = high, low
+            self.value_min.set_value(low)
+            self.value_max.set_value(high)
         return SearchPreset(
             date_from=date_from,
             date_to=date_to,
@@ -203,9 +248,13 @@ class SearchPage(QWidget):
             statuses=self.statuses.values(),
             methods=self.methods.values(),
             regions=[region] if region else [],
-            value_min=self.value_min.value() or None,
-            value_max=self.value_max.value() or None,
+            value_min=low,
+            value_max=high,
             doc_scopes=self.scopes.values(),
+            skip_signatures=self.skip_signatures.isChecked(),
+            only_extensions=[e.strip().lstrip(".").lower()
+                             for e in self.extensions.text().replace(";", ",").split(",")
+                             if e.strip()],
             download_files=True,
         )
 
@@ -241,14 +290,3 @@ class SearchPage(QWidget):
             f"  ·  помилок: {stats.get('errors', 0)}")
 
 
-def _money(placeholder: str) -> QDoubleSpinBox:
-    box = QDoubleSpinBox()
-    # Ширина поля визначається найдовшим можливим числом, тож верхню межу
-    # тримаємо в межах розумного для однієї закупівлі — 9,9 млрд грн.
-    box.setRange(0, 9_999_999_999)
-    box.setDecimals(0)
-    box.setGroupSeparatorShown(True)
-    box.setSpecialValueText(placeholder)
-    box.setValue(0)
-    box.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
-    return box

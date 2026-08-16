@@ -152,7 +152,9 @@ CREATE TABLE IF NOT EXISTS documents (
     hash           TEXT,
     size           INTEGER,
     local_path     TEXT,
-    state          TEXT DEFAULT 'pending',  -- pending / ok / skipped / error
+    -- pending (у черзі) / ok / skipped (завеликий) / filtered (відсіяний
+    -- налаштуваннями — при зміні фільтра розглядається знову) / error
+    state          TEXT DEFAULT 'pending',
     error          TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_docs_tender ON documents(tender_uuid);
@@ -302,9 +304,18 @@ class Database:
             (state, local_path, size, error, key),
         )
 
+    def mark_filtered(self, keys: Sequence[str], reason: str) -> None:
+        """Позначає документи як відсіяні фільтром (без завантаження)."""
+        self.executemany(
+            "UPDATE documents SET state='filtered', error=? WHERE key=?",
+            [(reason, key) for key in keys],
+        )
+
     def pending_documents(self, tender_uuids: Sequence[str] | None = None,
                           scopes: Sequence[str] | None = None) -> list[sqlite3.Row]:
-        sql = "SELECT * FROM documents WHERE state IN ('pending','error')"
+        # `filtered` теж потрапляє в чергу: якщо користувач змінив фільтр
+        # типів файлів, раніше відсіяні документи мають завантажитися.
+        sql = "SELECT * FROM documents WHERE state IN ('pending','error','filtered')"
         params: list[Any] = []
         if scopes:
             sql += f" AND scope IN ({','.join('?' * len(scopes))})"

@@ -21,6 +21,7 @@ from ..widgets.common import wrapped_label
 STATE_LABELS = {
     "ok": "Завантажено",
     "pending": "У черзі",
+    "filtered": "Відсіяно фільтром",
     "skipped": "Пропущено",
     "error": "Помилка",
 }
@@ -53,6 +54,7 @@ TOTALS_SQL = """
 SELECT COUNT(*) AS n,
        SUM(state = 'ok') AS ok,
        SUM(state = 'error') AS failed,
+       SUM(state = 'filtered') AS filtered,
        COALESCE(SUM(size), 0) AS bytes
 FROM documents {where}
 """
@@ -187,15 +189,16 @@ class FilesPage(QWidget):
 
     def reload(self) -> None:
         state = self.state_filter.currentData()
-        where = "WHERE state = ?" if state else ""
         params = [state] if state else []
 
         rows = [dict(r) for r in self.db.query(
-            SQL.format(where=where.replace("state", "d.state")), params + [MAX_ROWS])]
+            SQL.format(where="WHERE d.state = ?" if state else ""), params + [MAX_ROWS])]
         self.model.set_rows(rows)
 
-        totals = self.db.query(TOTALS_SQL.format(where=where), params)[0]
+        totals = self.db.query(
+            TOTALS_SQL.format(where="WHERE state = ?" if state else ""), params)[0]
         summary = (f"Документів: {totals['n']:,}  ·  завантажено {totals['ok'] or 0:,}"
+                   f"  ·  відсіяно {totals['filtered'] or 0:,}"
                    f"  ·  з помилками {totals['failed'] or 0:,}"
                    f"  ·  загальний обсяг {_human(totals['bytes']) or '0 Б'}")
         if len(rows) >= MAX_ROWS:

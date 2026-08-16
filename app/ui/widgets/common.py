@@ -3,13 +3,21 @@ from __future__ import annotations
 
 import re
 
-from PySide6.QtCore import QDate, Qt, Signal
+from PySide6.QtCore import QDate, QRegularExpression, Qt, Signal
+from PySide6.QtGui import QRegularExpressionValidator
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QDateEdit, QFrame, QGridLayout, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QPushButton, QSizePolicy, QVBoxLayout, QWidget,
 )
 
-EDRPOU_RE = re.compile(r"\d{6,10}")
+#: ЄДРПОУ юридичної особи — 8 цифр, РНОКПП фізичної — 10. Перевірка меж
+#: не дає розрізати один довгий номер на два «коди».
+EDRPOU_RE = re.compile(r"(?<!\d)\d{8,10}(?!\d)")
+
+
+def _as_qdate(value: str, fallback: QDate) -> QDate:
+    parsed = QDate.fromString(str(value or "")[:10], "yyyy-MM-dd")
+    return parsed if parsed.isValid() else fallback
 
 
 def wrapped_label(text: str, object_name: str = "Muted") -> QLabel:
@@ -74,6 +82,36 @@ class StatTile(QFrame):
         self.value.setText(value)
 
 
+class MoneyEdit(QLineEdit):
+    """Поле для суми в гривнях. Порожнє означає «без обмеження».
+
+    Свідомо не ``QDoubleSpinBox``: той при значенні-мінімумі показує
+    підказковий текст («від»), і будь-яка натиснута цифра дає «від5», що
+    валідатор відхиляє — поле стає незаповнюваним. Тут же приймаються
+    цифри з будь-якими роздільниками, а показується акуратно згрупована сума.
+    """
+
+    def __init__(self, placeholder: str, parent=None):
+        super().__init__(parent)
+        self.setPlaceholderText(placeholder)
+        # Приймаємо суму з будь-якими роздільниками: користувач може вставити
+        # її просто з порталу, де тисячі розділені нерозривним пробілом,
+        # якого шаблон \s у PCRE не покриває — звідси окремий \x{00a0}.
+        self.setValidator(QRegularExpressionValidator(
+            QRegularExpression(r"[\d\s\x{00a0}.,']*")))
+        self.editingFinished.connect(self._reformat)
+
+    def value(self) -> float | None:
+        digits = "".join(ch for ch in self.text() if ch.isdigit())
+        return float(digits) if digits else None
+
+    def set_value(self, value: float | None) -> None:
+        self.setText(f"{value:,.0f}".replace(",", " ") if value else "")
+
+    def _reformat(self) -> None:
+        self.set_value(self.value())
+
+
 class DateRange(QWidget):
     """Період «з … по» з кнопками швидкого вибору."""
 
@@ -130,8 +168,16 @@ class DateRange(QWidget):
                 self.date_to.date().toString("yyyy-MM-dd"))
 
     def set_values(self, date_from: str, date_to: str) -> None:
-        self.date_from.setDate(QDate.fromString(date_from[:10], "yyyy-MM-dd"))
-        self.date_to.setDate(QDate.fromString(date_to[:10], "yyyy-MM-dd"))
+        today = QDate.currentDate()
+        self.date_from.setDate(_as_qdate(date_from, today.addDays(-365)))
+        self.date_to.setDate(_as_qdate(date_to, today))
+
+    def normalize(self) -> None:
+        """Якщо межі переставлені місцями — міняє їх, щоб пошук не був порожнім."""
+        if self.date_from.date() > self.date_to.date():
+            first, second = self.date_to.date(), self.date_from.date()
+            self.date_from.setDate(first)
+            self.date_to.setDate(second)
 
 
 class EdrpouList(QWidget):
@@ -161,6 +207,11 @@ class EdrpouList(QWidget):
         self.list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         lay.addWidget(self.list)
 
+        self.hint = QLabel()
+        self.hint.setObjectName("Muted")
+        self.hint.setVisible(False)
+        lay.addWidget(self.hint)
+
         tools = QHBoxLayout()
         remove = QPushButton("Прибрати обране")
         remove.clicked.connect(self._remove)
@@ -172,7 +223,14 @@ class EdrpouList(QWidget):
         lay.addLayout(tools)
 
     def _add(self) -> None:
-        codes = EDRPOU_RE.findall(self.input.text())
+        raw = self.input.text().strip()
+        codes = EDRPOU_RE.findall(raw)
+        if raw and not codes:
+            # Мовчки з'їдений ввід — найгірше, що може зробити таке поле.
+            self.hint.setText("Не схоже на код: ЄДРПОУ — 8 цифр, РНОКПП ФОП — 10.")
+            self.hint.setVisible(True)
+            return
+        self.hint.setVisible(False)
         existing = set(self.values())
         for code in codes:
             if code not in existing:

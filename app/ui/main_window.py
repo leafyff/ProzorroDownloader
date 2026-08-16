@@ -134,9 +134,12 @@ class MainWindow(QMainWindow):
     # --- запуск завдань ---------------------------------------------------
 
     def _busy(self) -> bool:
-        if self.worker and self.worker.isRunning():
-            QMessageBox.information(self, "Зачекайте", "Попереднє завдання ще виконується.")
-            return True
+        """Одночасно виконуємо лише одне завдання: вони ділять і темп запитів, і базу."""
+        for worker, what in ((self.worker, "Попереднє завдання"),
+                             (self.index_worker, "Побудова індексу")):
+            if worker and worker.isRunning():
+                QMessageBox.information(self, "Зачекайте", f"{what} ще виконується.")
+                return True
         return False
 
     def _current_preset(self):
@@ -201,7 +204,7 @@ class MainWindow(QMainWindow):
         worker.log.connect(self.log_page.append)
         worker.progress.connect(self.search_page.set_progress)
         worker.stats.connect(self.search_page.set_stats)
-        worker.finished_job.connect(self._download_finished)
+        worker.finished_job.connect(self._retry_finished)
         self.worker = worker
         self.search_page.set_running(True)
         self.files_page.btn_retry.setEnabled(False)
@@ -229,6 +232,9 @@ class MainWindow(QMainWindow):
                 f"Файлів збережено: {result.files_ok}"
                 f" (пропущено {result.files_skipped}, помилок {result.files_failed})\n"
                 f"Обсяг: {result.bytes / 1048576:.1f} МБ")
+        if result.files_filtered:
+            text += (f"\nВідсіяно фільтром типів файлів: {result.files_filtered}"
+                     f" (переважно підписи КЕП)")
         if result.unresolved:
             text += (f"\n\nНе вдалося визначити ідентифікатор для {len(result.unresolved)} "
                      f"закупівель — здебільшого це ті, за якими ще немає договору. "
@@ -236,6 +242,20 @@ class MainWindow(QMainWindow):
         if result.error:
             text += f"\n\nПомилка: {result.error}"
         QMessageBox.information(self, "Завантаження завершено", text)
+
+    def _retry_finished(self, result) -> None:
+        self.search_page.set_running(False)
+        self.files_page.btn_retry.setEnabled(True)
+        self.files_page.reload()
+        self.statusBar().showMessage("Готово")
+        if result is None or result.cancelled:
+            return
+        left = self.db.scalar("SELECT COUNT(*) FROM documents WHERE state='error'") or 0
+        QMessageBox.information(
+            self, "Повтор завершено",
+            f"Дозавантажено файлів: {result.files_ok}"
+            f" (обсяг {result.bytes / 1048576:.1f} МБ).\n"
+            + (f"Не піддалися: {left}." if left else "Невдалих не лишилося."))
 
     def _count_finished(self, cards) -> None:
         self.search_page.set_running(False)
@@ -251,7 +271,7 @@ class MainWindow(QMainWindow):
     # --- індекс -----------------------------------------------------------
 
     def start_index(self, date_from: str, date_to: str) -> None:
-        if self.index_worker and self.index_worker.isRunning():
+        if self._busy():
             return
         since = _as_date(date_from)
         until = _as_date(date_to)
