@@ -1,3 +1,6 @@
-PySide6>=6.6
+# Програмі потрібні лише QtCore, QtGui та QtWidgets — вони всі в Essentials.
+# Повний пакет PySide6 тягне ще й Addons (QtWebEngine, Quick, Charts тощо):
+# це понад 400 МБ, які тут не використовуються.
+PySide6-Essentials>=6.6
 requests>=2.31
 openpyxl>=3.1

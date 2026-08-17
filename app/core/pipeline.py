@@ -11,13 +11,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..config import Settings, SearchPreset
-from ..paths import long_path
+from ..paths import export_path, long_path
 from .api import SEARCH_MAX_RESULTS, SEARCH_PAGE_SIZE, CdbApi, SearchApi
 from .classifiers import expand_prefixes
 from .db import Database
 from .downloader import (
     FileDownloader, document_extension, is_signature, normalize_extensions, tender_folder,
 )
+from .exporter import write_xlsx
 from .extract import latest_versions, parse_tender
 from .http import Cancelled, HttpClient
 from .market import MarketApi, class_codes, parse_product
@@ -44,6 +45,7 @@ class JobResult:
     files_filtered: int = 0        # відсіяно фільтром типів (підписи тощо)
     products: int = 0              # карток товарів е-каталогу
     bytes: int = 0
+    table: str = ""                # шлях до створеної таблиці
     cancelled: bool = False
     error: str = ""
 
@@ -552,6 +554,28 @@ class Pipeline:
         self._tick()
         return saved
 
+    # --- крок 6: таблиця з даними -----------------------------------------
+
+    def write_table(self) -> Path | None:
+        """Складає таблицю з усіма зібраними даними в теку завантажень."""
+        from .rawexport import build_sheets
+
+        sheets = build_sheets(self.db)
+        if not sheets:
+            return None
+        path = export_path("prozorro-дані")
+        try:
+            write_xlsx(path, sheets)
+        except Exception as exc:
+            self._log("error", f"Не вдалося записати таблицю: {exc}")
+            return None
+        self.result.table = str(path)
+        rows = sum(len(r) for _h, r in sheets.values())
+        self._log("info", f"Таблиця: {path.name} — {len(sheets)} аркушів, "
+                          f"{rows:,} рядків.".replace(",", " "))
+        self._tick()
+        return path
+
     # --- запуск -----------------------------------------------------------
 
     def run(self) -> JobResult:
@@ -570,6 +594,7 @@ class Pipeline:
                 self.download_files([row["uuid"] for row in rows])
             if self.p.collect_market:
                 self.collect_products()
+            self.write_table()
             self._log("info", "Готово.")
         except Cancelled:
             status = "cancelled"

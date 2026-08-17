@@ -133,6 +133,28 @@ def test_index_chunks() -> None:
           tender_id_of("UA-2026-08-13-007779-a") == "UA-2026-08-13-007779-a")
 
 
+def test_batch_files() -> None:
+    """Файли запуску мають лишатися суто ASCII.
+
+    Кирилиця в .bat ламає cmd.exe: після ``chcp`` він губить позицію у файлі
+    й починає виконувати уривки рядків як команди. Помилка виглядає як
+    «'середовище' is not recognized», а програма просто не стартує.
+    """
+    print("\n=== файли запуску ===")
+    root = Path(__file__).resolve().parent.parent
+    for name in ("run.bat", "run_console.bat"):
+        path = root / name
+        if not path.exists():
+            check(f"{name} існує", False)
+            continue
+        data = path.read_bytes()
+        bad = [b for b in data if b > 127]
+        check(f"{name}: лише ASCII", not bad, f"не-ASCII байтів: {len(bad)}")
+        check(f"{name}: без BOM", not data.startswith(b"\xef\xbb\xbf"))
+        text = data.decode("ascii", errors="replace")
+        check(f"{name}: запускає застосунок", "-m app.main" in text)
+
+
 def test_market() -> None:
     print("\n=== картки товарів е-каталогу ===")
     # Каталог класифікує товари на рівні класу, закупівлі — на рівні коду.
@@ -346,6 +368,7 @@ def main() -> int:
         test_extract()
         test_index_chunks()
         test_file_filter()
+        test_batch_files()
         test_market()
         test_paths(tmp)
         test_download_missing(tmp)

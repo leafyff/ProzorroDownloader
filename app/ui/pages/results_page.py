@@ -1,7 +1,6 @@
 """Сторінка «Результати»: таблиця знайдених закупівель і вивантаження у Excel."""
 from __future__ import annotations
 
-from datetime import date
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -17,6 +16,7 @@ from ...core.analytics import build_sheets as build_summary_sheets
 from ...core.db import Database
 from ...core.exporter import write_xlsx
 from ...core.rawexport import build_sheets as build_raw_sheets
+from ...paths import export_path
 
 COLUMNS = [
     ("tender_id", "Номер закупівлі", 175),
@@ -239,10 +239,9 @@ class ResultsPage(QWidget):
         if not self.model.rows:
             QMessageBox.information(self, "Немає даних", "Спочатку зберіть дані закупівель.")
             return
+        # Типово пропонуємо теку завантажень у проєкті — там-таки лежать і файли.
         path, _ = QFileDialog.getSaveFileName(
-            self, f"Зберегти: {title}",
-            str(Path.home() / f"{stem}-{date.today():%Y-%m-%d}.xlsx"),
-            "Книга Excel (*.xlsx)")
+            self, f"Зберегти: {title}", str(export_path(stem)), "Книга Excel (*.xlsx)")
         if not path:
             return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)

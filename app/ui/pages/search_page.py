@@ -27,6 +27,8 @@ class SearchPage(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        #: Яку з двох кнопок натиснули останньою — від цього залежить, чи качати файли.
+        self._with_files = False
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 20, 24, 16)
         root.setSpacing(14)
@@ -35,8 +37,9 @@ class SearchPage(QWidget):
         title.setObjectName("PageTitle")
         root.addWidget(title)
         root.addWidget(wrapped_label(
-            "Оберіть період і клас ДК021 — програма знайде закупівлі у відкритих даних "
-            "Prozorro, збереже картки й вивантажить усі прикріплені файли.", "PageHint"))
+            "Задайте фільтри й натисніть «Зібрати дані» — на виході буде одна таблиця. "
+            "«Зібрати файли» додатково завантажить документи закупівель у теку.",
+            "PageHint"))
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         left, right = self._build_left(), self._build_right()
@@ -113,15 +116,7 @@ class SearchPage(QWidget):
         refine.add(amount_row)
         lay.addWidget(refine)
 
-        files = Card("Що завантажувати")
-        self.mode = QComboBox()
-        self.mode.addItem("Тільки дані для аналітики — без файлів", False)
-        self.mode.addItem("Дані та файли закупівель", True)
-        self.mode.currentIndexChanged.connect(self._mode_changed)
-        files.add(self.mode)
-        self.mode_hint = wrapped_label("")
-        files.add(self.mode_hint)
-
+        files = Card("Що збирати")
         self.collect_market = QCheckBox("Додати картки товарів з е-каталогу Prozorro Market")
         self.collect_market.setToolTip(
             "Єдине джерело технічних характеристик, фото, штрихкодів і цінових "
@@ -137,6 +132,10 @@ class SearchPage(QWidget):
             "гарантійний термін, фото та квартилі ціни. Перший збір класу триває "
             "довго, надалі оновлюються лише змінені картки."))
         self.collect_market.toggled.connect(self.market_active_only.setEnabled)
+
+        files.add(wrapped_label(
+            "Нижче — налаштування для кнопки «Зібрати файли». На збір даних вони "
+            "не впливають."))
 
         self.files_box = QWidget()
         files_lay = QVBoxLayout(self.files_box)
@@ -221,16 +220,28 @@ class SearchPage(QWidget):
         self.status.setObjectName("Muted")
         buttons.addWidget(self.status, 1)
 
-        from PySide6.QtWidgets import QPushButton
         self.btn_count = QPushButton("Порахувати")
-        self.btn_count.setToolTip("Швидкий пошук без завантаження: скільки закупівель у фільтрі")
+        self.btn_count.setToolTip("Швидкий пошук без збору: скільки закупівель у фільтрі")
         self.btn_count.clicked.connect(self.start_count.emit)
         buttons.addWidget(self.btn_count)
 
-        self.btn_start = QPushButton("Завантажити все")
+        # Режим визначає натиснута кнопка, окремого перемикача немає.
+        self.btn_start = QPushButton("Зібрати дані")
         self.btn_start.setObjectName("Primary")
-        self.btn_start.clicked.connect(self.start_download.emit)
+        self.btn_start.setToolTip(
+            "Замовник, постачальник, суми, коди ДК021, учасники та технічні "
+            "характеристики товарів. На виході одна таблиця Excel, на диск нічого "
+            "не пишеться. Сотня закупівель — близько хвилини.")
+        self.btn_start.clicked.connect(lambda: self._start(with_files=False))
         buttons.addWidget(self.btn_start)
+
+        self.btn_files = QPushButton("Зібрати файли")
+        self.btn_files.setToolTip(
+            "Те саме плюс документи закупівель у теку на диску: вимоги, "
+            "специфікації, договори. Десятки-сотні мегабайт на сотню закупівель "
+            "і години часу — сервер документів віддає близько 30 КБ/с на потік.")
+        self.btn_files.clicked.connect(lambda: self._start(with_files=True))
+        buttons.addWidget(self.btn_files)
 
         self.btn_stop = QPushButton("Зупинити")
         self.btn_stop.setObjectName("Danger")
@@ -240,16 +251,9 @@ class SearchPage(QWidget):
         card.add(buttons)
         return card
 
-    def _mode_changed(self) -> None:
-        with_files = bool(self.mode.currentData())
-        self.files_box.setVisible(with_files)
-        self.mode_hint.setText(
-            "Замовник, постачальник, суми, коди ДК021 та учасники беруться з картки "
-            "закупівлі — файли для цього не потрібні. Так пошук іде в рази швидше."
-            if not with_files else
-            "Додатково качаються документи: технічні вимоги, специфікації, договори. "
-            "Це десятки-сотні мегабайт на сотню закупівель.")
-        self.btn_start.setText("Зібрати дані" if not with_files else "Завантажити все")
+    def _start(self, *, with_files: bool) -> None:
+        self._with_files = with_files
+        self.start_download.emit()
 
     # --- обмін з налаштуваннями ------------------------------------------
 
@@ -269,11 +273,10 @@ class SearchPage(QWidget):
         self.value_max.set_value(preset.value_max)
         self.skip_signatures.setChecked(preset.skip_signatures)
         self.extensions.setText(", ".join(preset.only_extensions or []))
-        self.mode.setCurrentIndex(1 if preset.download_files else 0)
+        self._with_files = bool(preset.download_files)
         self.collect_market.setChecked(preset.collect_market)
         self.market_active_only.setChecked(preset.market_active_only)
         self.market_active_only.setEnabled(preset.collect_market)
-        self._mode_changed()
 
     def to_preset(self) -> SearchPreset:
         self.dates.normalize()
@@ -302,7 +305,7 @@ class SearchPage(QWidget):
             only_extensions=[e.strip().lstrip(".").lower()
                              for e in self.extensions.text().replace(";", ",").split(",")
                              if e.strip()],
-            download_files=bool(self.mode.currentData()),
+            download_files=self._with_files,
             collect_market=self.collect_market.isChecked(),
             market_active_only=self.market_active_only.isChecked(),
         )
@@ -311,6 +314,7 @@ class SearchPage(QWidget):
 
     def set_running(self, running: bool) -> None:
         self.btn_start.setEnabled(not running)
+        self.btn_files.setEnabled(not running)
         self.btn_count.setEnabled(not running)
         self.btn_stop.setEnabled(running)
         if not running:

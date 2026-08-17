@@ -3,37 +3,41 @@ from __future__ import annotations
 
 import os
 import re
-import sys
+from datetime import datetime
 from pathlib import Path
 
-# Корінь проєкту (тека, де лежить run.bat)
-if getattr(sys, "frozen", False):  # зібраний .exe
-    PROJECT_ROOT = Path(sys.executable).parent
-else:
-    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# Корінь проєкту — тека, де лежить run.bat.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+# Вбудовані довідники: класифікатор ДК021 та перелік регіонів.
 BUNDLED_DATA = PROJECT_ROOT / "data"
 
 
 def user_data_dir() -> Path:
-    """Тека користувача для БД, налаштувань і логів."""
-    base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
-    if base:
-        p = Path(base) / "ProzorroDownloader"
-    else:
-        p = Path.home() / ".prozorro-downloader"
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    """Тека для бази й налаштувань.
+
+    Свідомо всередині проєкту, а не в ``%LOCALAPPDATA%``: так усе, що програма
+    створює, лежить в одному місці — теку можна перенести чи скопіювати разом
+    із даними, і ніщо не губиться поза нею.
+    """
+    PROJECT_ROOT.mkdir(parents=True, exist_ok=True)
+    return PROJECT_ROOT
 
 
 def default_output_dir() -> Path:
-    """Тека за замовчуванням для завантажених файлів."""
+    """Тека для завантажених файлів і вивантажених таблиць."""
     return PROJECT_ROOT / "downloads"
+
+
+def export_path(stem: str, suffix: str = ".xlsx") -> Path:
+    """Шлях для нової таблиці в теці завантажень, з відміткою часу в назві."""
+    folder = default_output_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / f"{stem}-{datetime.now():%Y-%m-%d-%H%M}{suffix}"
 
 
 SETTINGS_FILE = user_data_dir() / "settings.json"
 DB_FILE = user_data_dir() / "prozorro.db"
-LOG_DIR = user_data_dir() / "logs"
 
 
 # --- безпечні імена файлів/тек для Windows -------------------------------

@@ -249,14 +249,21 @@ class MainWindow(QMainWindow):
             text += "\nФайли не завантажувалися."
         if result.products:
             text += f"\nКарток товарів у каталозі: {result.products}"
-        text += ("\n\nВивантажити зібране: «Результати» → «Вивантажити всі дані».")
+        if result.table:
+            text += f"\n\nТаблиця з даними:\n{result.table}"
         if result.unresolved:
             text += (f"\n\nНе вдалося визначити ідентифікатор для {len(result.unresolved)} "
                      f"закупівель — здебільшого це ті, за якими ще немає договору. "
                      f"Побудуйте локальний індекс у налаштуваннях, щоб охопити їх.")
         if result.error:
             text += f"\n\nПомилка: {result.error}"
-        QMessageBox.information(self, "Завантаження завершено", text)
+        box = QMessageBox(QMessageBox.Icon.Information, "Збір завершено", text, parent=self)
+        box.addButton(QMessageBox.StandardButton.Ok)
+        if result.table:
+            open_btn = box.addButton("Відкрити теку", QMessageBox.ButtonRole.ActionRole)
+        box.exec()
+        if result.table and box.clickedButton() is open_btn:
+            self.files_page.open_output_dir()
 
     def _retry_finished(self, result) -> None:
         self.search_page.set_running(False)
