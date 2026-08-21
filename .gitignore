@@ -1,5 +1,5 @@
-.venv
-.idea
+.venv/
+.idea/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -14,7 +14,6 @@ __pycache__/
 build/
 develop-eggs/
 dist/
-downloads/
 eggs/
 .eggs/
 lib/
@@ -182,8 +181,40 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
-# ???? ?? ???????????? ???????? (??????????? ? ???? ???????)
+# --- локальні дані застосунку --------------------------------------------
+# База, налаштування й усе завантажене живуть у теці проєкту (див. paths.py),
+# тож без цих правил перший же коміт затягнув би сотні мегабайтів чужих файлів.
 prozorro.db
 prozorro.db-*
 prozorro.db.before-merge
 settings.json
+settings.tmp
+downloads/
+
+# Вивантажені таблиці, якщо зберегти їх повз теку downloads.
+prozorro-*.xlsx
+prozorro-*.csv
+
+# --- редактори та IDE ----------------------------------------------------
+*.iml
+.vscode/
+*.code-workspace
+.fleet/
+*.sublime-project
+*.sublime-workspace
+.claude/settings.local.json
+CLAUDE.local.md
+
+# --- сміття операційної системи -------------------------------------------
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# --- тимчасові й резервні файли -------------------------------------------
+*.bak
+*.tmp
+*.orig
+*.rej
+*~

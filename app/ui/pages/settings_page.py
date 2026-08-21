@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QProgressBar, QPushButton, QScrollArea, QSpinBox, QVBoxLayout, QWidget,
 )
 
-from ...config import Settings
+from ...config import OWN_COMPANIES, Settings
 from ...core.db import Database
 from ..widgets.common import Card, DateRange, EdrpouList, wrapped_label
 
@@ -101,7 +101,7 @@ class SettingsPage(QWidget):
                     "ЄДРПОУ ваших ТОВ потрібні, щоб у майбутньому аналізі відрізняти власні "
                     "закупівлі від чужих. Список конкурентів підставляється у фільтр пошуку.")
         card.add(QLabel("Наші ЄДРПОУ", objectName="Muted"))
-        self.own_edrpou = EdrpouList("ЄДРПОУ вашого ТОВ")
+        self.own_edrpou = EdrpouList("ЄДРПОУ вашого ТОВ", labels=OWN_COMPANIES)
         card.add(self.own_edrpou)
         card.add(QLabel("Конкуренти, яких відстежуємо", objectName="Muted"))
         self.competitors = EdrpouList("ЄДРПОУ конкурента")

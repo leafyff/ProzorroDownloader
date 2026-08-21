@@ -14,8 +14,15 @@ from .paths import SETTINGS_FILE, default_output_dir
 #: Клас ДК021 за замовчуванням — 30 «Офісна та комп'ютерна техніка».
 DEFAULT_CPV_PREFIXES = ["30"]
 
-#: Скільки місяців історії брати за замовчуванням.
-DEFAULT_PERIOD_MONTHS = 12
+#: Наші ТОВ: код ЄДРПОУ → назва. Потрібні, щоб відрізняти власні закупівлі
+#: від чужих; назви показуємо в налаштуваннях, щоб код не був німим числом.
+OWN_COMPANIES = {
+    "41263186": "ПАРТНЕР АЙ ТІ",
+    "44728541": "РЕФОРМА СИСТЕМЗ",
+}
+
+#: Наші ЄДРПОУ за замовчуванням.
+DEFAULT_OWN_EDRPOU = list(OWN_COMPANIES)
 
 #: Типи документів, які качаємо за замовчуванням (порожньо = усі).
 DOC_SCOPES = {
@@ -127,7 +134,7 @@ class SearchPreset:
 class Settings:
     output_dir: str = field(default_factory=lambda: str(default_output_dir()))
     #: Наші ЄДРПОУ — щоб відрізняти «нас» від конкурентів в аналітиці.
-    own_edrpou: list[str] = field(default_factory=list)
+    own_edrpou: list[str] = field(default_factory=lambda: list(DEFAULT_OWN_EDRPOU))
     #: Конкуренти, яких відстежуємо постійно.
     competitors: list[str] = field(default_factory=list)
 

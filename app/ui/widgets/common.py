@@ -185,8 +185,12 @@ class EdrpouList(QWidget):
 
     changed = Signal()
 
-    def __init__(self, placeholder: str = "ЄДРПОУ або кілька через кому", parent=None):
+    def __init__(self, placeholder: str = "ЄДРПОУ або кілька через кому",
+                 labels: dict[str, str] | None = None, parent=None):
         super().__init__(parent)
+        #: Відомі назви компаній: у списку показуємо «код — назва», щоб рядок
+        #: не був німим числом. Назовні віддаємо самі коди.
+        self.labels = dict(labels or {})
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
@@ -234,7 +238,7 @@ class EdrpouList(QWidget):
         existing = set(self.values())
         for code in codes:
             if code not in existing:
-                QListWidgetItem(code, self.list)
+                self._add_item(code)
                 existing.add(code)
         self.input.clear()
         self.changed.emit()
@@ -248,13 +252,19 @@ class EdrpouList(QWidget):
         self.list.clear()
         self.changed.emit()
 
+    def _add_item(self, code: str) -> None:
+        name = self.labels.get(code)
+        item = QListWidgetItem(f"{code} — {name}" if name else code, self.list)
+        item.setData(Qt.ItemDataRole.UserRole, code)
+
     def values(self) -> list[str]:
-        return [self.list.item(i).text() for i in range(self.list.count())]
+        items = (self.list.item(i) for i in range(self.list.count()))
+        return [item.data(Qt.ItemDataRole.UserRole) or item.text() for item in items]
 
     def set_values(self, codes: list[str]) -> None:
         self.list.clear()
         for code in codes or []:
-            QListWidgetItem(str(code), self.list)
+            self._add_item(str(code))
         self.changed.emit()
 
 
