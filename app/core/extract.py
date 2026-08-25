@@ -127,7 +127,7 @@ def latest_versions(docs: list[dict]) -> list[dict]:
 
 # --- розбір картки на рядки таблиць ---------------------------------------
 
-def parse_tender(tender: dict) -> dict:
+def parse_tender(tender: dict, *, keep_urls: bool = True) -> dict:
     """Перетворює JSON закупівлі на набір рядків для БД.
 
     Повний JSON у базі не зберігається: він важить десятки кілобайт на
@@ -219,11 +219,16 @@ def parse_tender(tender: dict) -> dict:
     doc_rows = []
     for doc in docs_raw:
         key = f"{uuid}|{doc['container']}|{doc['doc_id'] or doc['url'][-32:]}|{doc['date_published']}"
+        # Коли файли не качаємо, посилання зберігати нема сенсу: у типовій
+        # закупівлі це два десятки підписаних адрес по двісті символів, і на
+        # сорока тисячах закупівель вони самі важать більше, ніж усі картки
+        # разом. Назва, тип і власник файлу лишаються — саме за ними аналітика
+        # впізнає сертифікати й авторизаційні листи.
         doc_rows.append((
             key, doc["doc_id"], uuid, tender_id, doc["scope"], doc["container"],
             doc["owner_name"], doc["owner_edrpou"], doc["doc_type"], doc["title"],
-            doc["format"], doc["date_published"], doc["url"], doc["hash"],
-            0, "", "pending", "",
+            doc["format"], doc["date_published"], doc["url"] if keep_urls else "",
+            doc["hash"], 0, "", "pending", "",
         ))
 
     row = {

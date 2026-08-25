@@ -25,6 +25,12 @@ from typing import Any, Iterator
 from .http import HttpClient
 
 SEARCH_BASE = "https://prozorro.gov.ua/api/search"
+
+#: Картка закупівлі за **людським** номером (``UA-2026-08-25-009929-a``).
+#: Єдине відоме джерело, яке приймає номер напряму й повертає внутрішній UUID;
+#: сам портал саме ним і користується, відкриваючи сторінку закупівлі.
+#: Відповідь — близько 2 КБ, тоді як ``/details`` віддає 100 КБ.
+SUMMARY_URL = "https://prozorro.gov.ua/api/tenders/{tender_id}/summary"
 CDB_BASE = "https://public.api.openprocurement.org/api/2.5"
 
 SEARCH_PAGE_SIZE = 20
@@ -32,9 +38,13 @@ SEARCH_MAX_PAGE = 500          # обмеження серверу
 SEARCH_MAX_RESULTS = SEARCH_PAGE_SIZE * SEARCH_MAX_PAGE
 
 #: Поля стрічки змін. ЦБД дозволяє лише невеликий перелік
-#: (tenderID, status, procurementMethodType, dateCreated, procuringEntity, contracts);
-#: для індексу беремо мінімум — так відповідь у кілька разів менша, а отже швидша.
-FEED_OPT_FIELDS = "tenderID,dateCreated,status"
+#: (tenderID, status, procurementMethodType, dateCreated, procuringEntity, contracts).
+#:
+#: Індексу потрібні тільки ``tenderID`` та ``id`` — більше з таблиці
+#: ``tender_index`` ніде не читається. Виміряно: із ``dateCreated,status``
+#: запис стрічки важить 209 байт, без них — 135, тобто на 36% менше. Побудова
+#: індексу на 99% складається з очікування мережі, тож це прямий виграш.
+FEED_OPT_FIELDS = "tenderID"
 
 
 class SearchApi:

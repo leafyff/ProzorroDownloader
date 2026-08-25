@@ -9,15 +9,20 @@ from PySide6.QtWidgets import (
     QMessageBox, QProgressBar, QPushButton, QScrollArea, QSpinBox, QVBoxLayout, QWidget,
 )
 
-from ...config import OWN_COMPANIES, Settings
+from ...config import COMPETITOR_COMPANIES, OWN_COMPANIES, Settings
 from ...core.db import Database
 from ..widgets.common import Card, DateRange, EdrpouList, wrapped_label
 
 RESOLVE_MODES = {
-    "auto": "Автоматично — спершу через договори, індекс лише за потреби",
-    "contracts": "Лише через договори — швидко, але без закупівель без договору",
-    "index": "Через повний індекс — найповніше, потребує часу на першу побудову",
+    "auto": "Автоматично — за розміром вибірки (рекомендовано)",
+    "summary": "Опитувати портал поштучно — швидко для вузьких вибірок",
+    "index": "Через повний індекс — вигідно для великих вибірок",
 }
+
+
+def _spaced(number) -> str:
+    """``12345`` → ``12 345`` — тисячі пробілом, решта тексту недоторкана."""
+    return f"{number:,}".replace(",", " ")
 
 
 class SettingsPage(QWidget):
@@ -80,9 +85,17 @@ class SettingsPage(QWidget):
         row.addWidget(browse)
         card.add(row)
 
+        self.fresh_start = QCheckBox("Очищати зібране перед новим збором")
+        self.fresh_start.setToolTip(
+            "Без цього база стає архівом усіх колишніх пошуків, і аналітика"
+            " рахує ринок по суміші вибірок: свіжі ІТ-закупівлі разом\n"
+            "із залишками попереднього збору за іншим класом ДК021.\n\n"
+            "Індекс tenderID→UUID очищення не зачіпає — він здобувається"
+            " дорого й від предмета збору не залежить.")
         self.skip_existing = QCheckBox("Не перезавантажувати файли, які вже є на диску")
         self.save_json = QCheckBox("Зберігати повний JSON закупівлі поруч із файлами")
         self.all_versions = QCheckBox("Качати всі версії документів, а не лише останню")
+        card.add(self.fresh_start)
         card.add(self.skip_existing)
         card.add(self.save_json)
         card.add(self.all_versions)
@@ -98,13 +111,15 @@ class SettingsPage(QWidget):
 
     def _card_companies(self) -> Card:
         card = Card("Наші компанії та конкуренти",
-                    "ЄДРПОУ ваших ТОВ потрібні, щоб у майбутньому аналізі відрізняти власні "
-                    "закупівлі від чужих. Список конкурентів підставляється у фільтр пошуку.")
+                    "ЄДРПОУ ваших ТОВ потрібні, щоб в аналітиці відрізняти власні "
+                    "закупівлі від чужих. Конкуренти зі списку розбираються поіменно "
+                    "завжди — навіть якщо в конкретній вибірці вони за обсягом не "
+                    "потрапили б у верхівку рейтингу.")
         card.add(QLabel("Наші ЄДРПОУ", objectName="Muted"))
         self.own_edrpou = EdrpouList("ЄДРПОУ вашого ТОВ", labels=OWN_COMPANIES)
         card.add(self.own_edrpou)
         card.add(QLabel("Конкуренти, яких відстежуємо", objectName="Muted"))
-        self.competitors = EdrpouList("ЄДРПОУ конкурента")
+        self.competitors = EdrpouList("ЄДРПОУ конкурента", labels=COMPETITOR_COMPANIES)
         card.add(self.competitors)
         return card
 
@@ -112,8 +127,11 @@ class SettingsPage(QWidget):
         card = Card(
             "Локальний індекс закупівель",
             "Пошук порталу віддає лише номер закупівлі (UA-…), а файли лежать у Центральній "
-            "базі, яка адресує закупівлі за внутрішнім ідентифікатором. Індекс — це локальна "
-            "таблиця відповідності. Без нього доступні лише закупівлі, за якими вже є договір.")
+            "базі, яка адресує закупівлі за внутрішнім ідентифікатором. Портал уміє "
+            "віддати відповідність за номером, але має квоту — 58 запитів на хвилину, "
+            "тож поштучне опитування вигідне лише для вузьких вибірок. Індекс — це "
+            "локальна таблиця, яку будує обхід стрічки змін: квоти не витрачає, зате "
+            "коштує пропорційно довжині періоду. «Автоматично» обирає дешевше.")
         row = QHBoxLayout()
         row.addWidget(QLabel("Спосіб розпізнавання:"))
         self.resolve_mode = QComboBox()
@@ -146,15 +164,20 @@ class SettingsPage(QWidget):
         clear = QPushButton("Очистити індекс")
         clear.clicked.connect(self._clear_index)
         buttons.addWidget(clear)
+        drop = QPushButton("Прибрати зібране")
+        drop.setToolTip("Видалити картки закупівель і товарів, лишивши індекс.")
+        drop.clicked.connect(self._clear_collected)
+        buttons.addWidget(drop)
         card.add(buttons)
         return card
 
     def _card_network(self) -> Card:
         card = Card("Мережа та швидкість",
-                    "Відкриті API Prozorro обмежують темп запитів. Занадто високі значення "
-                    "не пришвидшать роботу, натомість спричинять повтори. Пошуковий портал "
-                    "жорсткіший за Центральну базу, тому для нього діє окреме обмеження "
-                    "у два запити на секунду — воно застосовується завжди.")
+                    "Кожен сервер має власне обмеження, виміряне на живих API, і воно "
+                    "діє завжди. Пошуковий портал дає 60 запитів на хвилину — не темп, "
+                    "а квоту на вікно, тож зайві потоки там лише чекають у черзі. "
+                    "Центральна база квоти не має і тримає близько 30 запитів на секунду "
+                    "при 16 з'єднаннях. Загальний темп нижче стосується решти серверів.")
         grid = QVBoxLayout()
         self.rate_limit = _spin(1, 60, " запитів/с")
         self.search_conc = _spin(1, 16, " потоків")
@@ -164,7 +187,7 @@ class SettingsPage(QWidget):
         self.timeout = _spin(10, 300, " с")
         self.retries = _spin(0, 10, " спроб")
         for label, widget in [
-            ("Загальний темп запитів", self.rate_limit),
+            ("Темп для інших серверів", self.rate_limit),
             ("Паралельних пошукових запитів", self.search_conc),
             ("Паралельних завантажень карток", self.detail_conc),
             ("Паралельних завантажень файлів", self.download_conc),
@@ -198,6 +221,7 @@ class SettingsPage(QWidget):
     def load(self) -> None:
         s = self.s
         self.output_dir.setText(s.output_dir)
+        self.fresh_start.setChecked(s.fresh_start)
         self.skip_existing.setChecked(s.skip_existing)
         self.save_json.setChecked(s.save_tender_json)
         self.all_versions.setChecked(s.download_all_versions)
@@ -219,6 +243,7 @@ class SettingsPage(QWidget):
     def apply(self) -> None:
         s = self.s
         s.output_dir = self.output_dir.text().strip() or s.output_dir
+        s.fresh_start = self.fresh_start.isChecked()
         s.skip_existing = self.skip_existing.isChecked()
         s.save_tender_json = self.save_json.isChecked()
         s.download_all_versions = self.all_versions.isChecked()
@@ -280,14 +305,37 @@ class SettingsPage(QWidget):
         date_from, date_to = self.index_dates.values()
         self.build_index.emit(date_from, date_to)
 
+    def _clear_collected(self) -> None:
+        """Ручне очищення — коли базу треба прибрати, не запускаючи збір."""
+        rows = sum(self.db.scalar(f"SELECT COUNT(*) FROM {t}") or 0
+                   for t in self.db.COLLECTED)
+        if not rows:
+            QMessageBox.information(self, "Уже порожньо",
+                                    "У базі немає зібраних карток.")
+            return
+        answer = QMessageBox.question(
+            self, "Прибрати зібране",
+            f"Буде видалено {rows:,} рядків карток закупівель і товарів.\n\n"
+            f"Індекс tenderID→UUID лишиться — його не доведеться будувати "
+            f"заново. Вивантажені книги .xlsx і завантажені документи на диску "
+            f"теж лишаться недоторканими.\n\nПродовжити?".replace(",", " "))
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        removed = self.db.reset_collected()
+        QMessageBox.information(
+            self, "Готово",
+            "Прибрано:\n" + "\n".join(f"  {table} — {n:,}".replace(",", " ")
+                                      for table, n in removed.items()))
+        self.refresh_index_info()
+
     def _clear_index(self) -> None:
         size = self.db.index_size()
         answer = QMessageBox.question(
             self, "Очистити індекс",
-            f"Вилучити {size:,} записів індексу та стиснути файл бази?\n\n"
+            f"Вилучити {_spaced(size)} записів індексу та стиснути файл бази?\n\n"
             f"Завантажені картки закупівель і файли не постраждають, але "
             f"індекс доведеться будувати наново. Стиснення великої бази може "
-            f"тривати кілька хвилин.".replace(",", " "))
+            f"тривати кілька хвилин.")
         if answer != QMessageBox.StandardButton.Yes:
             return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -314,10 +362,10 @@ class SettingsPage(QWidget):
         except OSError:
             pass
         self.index_info.setText(
-            f"У індексі {size:,} закупівель, покрито діб: {days}. Файл бази: {db_mb:.0f} МБ. "
+            f"У індексі {_spaced(size)} закупівель, покрито діб: {days}. "
+            f"Файл бази: {db_mb:.0f} МБ. "
             f"Орієнтовна швидкість побудови — близько 2 000 записів/с, "
-            f"тобто повний рік займає 30–50 хвилин і додає ~400 МБ."
-            .replace(",", " "))
+            f"тобто повний рік займає 30–50 хвилин і додає ~400 МБ.")
 
     def set_index_running(self, running: bool) -> None:
         self.btn_index.setEnabled(not running)

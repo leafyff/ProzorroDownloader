@@ -1,7 +1,6 @@
 """Вивантаження результатів у XLSX і CSV."""
 from __future__ import annotations
 
-import csv
 from pathlib import Path
 from typing import Sequence
 
@@ -46,13 +45,4 @@ def write_xlsx(path: Path, sheets: dict[str, tuple[Sequence[str], Sequence[Seque
         ws.auto_filter.ref = ws.dimensions
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(long_path(path))
-    return path
-
-
-def write_csv(path: Path, headers: Sequence[str], rows: Sequence[Sequence]) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(long_path(path), "w", encoding="utf-8-sig", newline="") as fh:
-        writer = csv.writer(fh, delimiter=";")
-        writer.writerow(headers)
-        writer.writerows(rows)
     return path

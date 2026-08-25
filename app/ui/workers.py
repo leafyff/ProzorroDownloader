@@ -1,12 +1,14 @@
-"""Фонові потоки: конвеєр завантаження та побудова індексу."""
+"""Фонові потоки: конвеєр завантаження, побудова індексу та аналітика."""
 from __future__ import annotations
 
 import threading
 from datetime import date
+from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal
 
 from ..config import SearchPreset, Settings
+from ..core import insight, xlsxload
 from ..core.db import Database
 from ..core.http import Cancelled, HttpClient
 from ..core.pipeline import Pipeline
@@ -222,3 +224,64 @@ class IndexWorker(QThread):
         finally:
             client.close()
             self.bridge.finished.emit(count)
+
+
+class AnalysisWorker(QThread):
+    """Читання книги Excel і повний аналіз — поза потоком інтерфейсу.
+
+    Розбір великого вивантаження — це десятки тисяч рядків, розпізнавання ТМ
+    у кожному описі та кілька проходів статистики; у головному потоці вікно
+    б замерзало. Результат приходить парою ``(звіт, помилка)``: так сторінці
+    не треба здогадуватись, чому звіту немає.
+    """
+
+    def __init__(self, path: Path, settings: Settings, drop_outliers: bool = True,
+                 top_competitors: int = 20, parent=None):
+        super().__init__(parent)
+        self.path = Path(path)
+        self.settings = settings
+        self.drop_outliers = drop_outliers
+        self.top_competitors = top_competitors
+        self.cancel_event = threading.Event()
+        self.bridge = _Bridge()
+
+    def stop(self) -> None:
+        self.cancel_event.set()
+
+    @property
+    def progress(self):
+        return self.bridge.progress
+
+    @property
+    def log(self):
+        return self.bridge.log
+
+    @property
+    def finished_job(self):
+        return self.bridge.finished
+
+    def run(self) -> None:
+        report = None
+        error = ""
+        try:
+            # Читання й аналіз — два етапи одного поступу, тож зсуваємо
+            # лічильник читання в перші кроки спільної шкали.
+            data = xlsxload.load(
+                self.path,
+                lambda stage, done, total: self.bridge.progress.emit(stage, done, total + 8))
+            report = insight.analyse(
+                data,
+                own_edrpou=self.settings.own_edrpou,
+                tracked=self.settings.competitors,
+                drop_outliers=self.drop_outliers,
+                top_competitors=self.top_competitors,
+                on_progress=lambda stage, done, total:
+                    self.bridge.progress.emit(stage, done + 9, total + 9),
+                cancel_event=self.cancel_event)
+        except insight.Cancelled:
+            self.bridge.log.emit("warn", "Аналіз зупинено.")
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            self.bridge.log.emit("error", f"Аналіз не вдався: {error}")
+        finally:
+            self.bridge.finished.emit((report, error))

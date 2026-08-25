@@ -115,9 +115,10 @@ def _display(key: str, value) -> str:
 
 
 class ResultsPage(QWidget):
-    def __init__(self, db: Database, parent=None):
+    def __init__(self, db: Database, get_output_dir=None, parent=None):
         super().__init__(parent)
         self.db = db
+        self.get_output_dir = get_output_dir
         self._pending: list[dict] = []
         self._truncated = False
         self._flush_timer = QTimer(self)
@@ -239,9 +240,12 @@ class ResultsPage(QWidget):
         if not self.model.rows:
             QMessageBox.information(self, "Немає даних", "Спочатку зберіть дані закупівель.")
             return
-        # Типово пропонуємо теку завантажень у проєкті — там-таки лежать і файли.
+        # Типово пропонуємо теку вивантаження з налаштувань — там-таки лежать
+        # і завантажені файли, і книга, яку складає конвеєр.
+        folder = self.get_output_dir() if self.get_output_dir else None
         path, _ = QFileDialog.getSaveFileName(
-            self, f"Зберегти: {title}", str(export_path(stem)), "Книга Excel (*.xlsx)")
+            self, f"Зберегти: {title}", str(export_path(stem, folder=folder)),
+            "Книга Excel (*.xlsx)")
         if not path:
             return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -256,11 +260,3 @@ class ResultsPage(QWidget):
         listing = "\n".join(f"  · {name} — {len(rows):,} рядків".replace(",", " ")
                             for name, (_h, rows) in sheets.items())
         QMessageBox.information(self, "Готово", f"Збережено:\n{path}\n\n{listing}")
-
-
-def _export_value(key: str, value):
-    if key in ("value_amount", "contract_sum"):
-        return float(value) if value not in (None, "") else None
-    if key in ("n_bids", "n_docs"):
-        return int(value or 0)
-    return _display(key, value)

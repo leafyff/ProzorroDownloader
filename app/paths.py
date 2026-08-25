@@ -29,9 +29,16 @@ def default_output_dir() -> Path:
     return PROJECT_ROOT / "downloads"
 
 
-def export_path(stem: str, suffix: str = ".xlsx") -> Path:
-    """Шлях для нової таблиці в теці завантажень, з відміткою часу в назві."""
-    folder = default_output_dir()
+def export_path(stem: str, suffix: str = ".xlsx",
+                folder: Path | str | None = None) -> Path:
+    """Шлях для нової таблиці з відміткою часу в назві.
+
+    ``folder`` — тека вивантаження з налаштувань; без неї береться типова.
+    Передавати її треба скрізь, де книгу потім шукає сама програма: сторінка
+    аналітики перебирає саме ``Settings.output_dir``, тож книга, збережена
+    повз цю теку, звідти не видно.
+    """
+    folder = Path(folder) if folder else default_output_dir()
     folder.mkdir(parents=True, exist_ok=True)
     return folder / f"{stem}-{datetime.now():%Y-%m-%d-%H%M}{suffix}"
 

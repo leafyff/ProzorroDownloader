@@ -3,16 +3,18 @@ from __future__ import annotations
 
 import json
 import threading
-from collections import Counter
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
-from ..config import Settings, SearchPreset
+from ..config import METHOD_LABELS, Settings, SearchPreset
 from ..paths import export_path, long_path
-from .api import SEARCH_MAX_RESULTS, SEARCH_PAGE_SIZE, CdbApi, SearchApi
+from .api import (
+    SEARCH_MAX_PAGE, SEARCH_MAX_RESULTS, SEARCH_PAGE_SIZE, CdbApi, SearchApi,
+)
 from .classifiers import expand_prefixes
 from .db import Database
 from .downloader import (
@@ -22,14 +24,28 @@ from .exporter import write_xlsx
 from .extract import latest_versions, parse_tender
 from .http import Cancelled, HttpClient
 from .market import MarketApi, class_codes, parse_product
-from .resolver import IndexBuilder, Resolver, tender_id_of
+from .resolver import IndexBuilder, Resolver
 
 LogCb = Callable[[str, str], None]
 ProgressCb = Callable[[str, int, int], None]
 StatsCb = Callable[[dict], None]
 
+#: Максимальна довжина значення proc_type у пошуку — сервер відхиляє довші
+#: з HTTP 422. Одна назва процедури (`closeFrameworkAgreementSelectionUA`) у неї
+#: не вміщається, тож у розрізі за процедурами вона недоступна.
+PROC_TYPE_MAX_LEN = 30
+
 #: Скільки поспіль «застарих» сторінок терпимо, перш ніж зупинити гортання.
 STALE_PAGE_TOLERANCE = 3
+
+#: На скільки днів гортаємо глибше за початок періоду.
+#:
+#: Відколи відбір, зупинка й упорядкування видачі спираються на одну дату
+#: (:meth:`Pipeline._published`), запас потрібен лише на межу доби: дати в
+#: номері й у ``dateCreated`` записані в місцевому часі, а картка могла бути
+#: створена опівночі. Раніше тут стояло 30 днів — саме стільки доводилося
+#: гортати намарно, бо пошук фільтрував за однією датою, а сортував за іншою.
+LOOKBACK_SLACK_DAYS = 2
 
 
 @dataclass
@@ -114,180 +130,121 @@ class Pipeline:
         return self._codes_cache
 
     @staticmethod
-    def _card_date(card: dict) -> str:
-        """Дата оприлюднення закупівлі, витягнута з картки пошуку."""
-        for key in ("tenderPeriod", "enquiryPeriod", "auctionPeriod"):
+    def _published(card: dict) -> str:
+        """Дата оприлюднення закупівлі, як її бачить пошук.
+
+        Це наріжна дата всього пошуку, і вона одна: за нею портал упорядковує
+        видачу, за нею ж ми відбираємо закупівлі в період, і їй дорівнює
+        ``dateCreated`` у Центральній базі — саме за ним потім фільтрує
+        :meth:`_passes_filters`. Перевірено на живих даних: збіг повний.
+
+        Надійніше за все вона закодована в самому номері
+        (``UA-2026-08-21-010792-a``); ``enquiryPeriod.startDate`` — запасний
+        варіант для карток із нетиповим номером.
+
+        Раніше тут поверталося ``tenderPeriod.startDate`` — початок подання
+        пропозицій. Це інша дата: закупівлю оголошують 21 серпня, а пропозиції
+        приймають з 27-го. Через розбіжність пошук викидав закупівлі, які
+        остаточний відбір мав прийняти, і доводилося гортати на місяць глибше
+        за період, аби їх наздогнати.
+        """
+        tid = card.get("tenderID") or ""
+        if len(tid) > 13:
+            return tid[3:13]
+        for key in ("enquiryPeriod", "tenderPeriod", "auctionPeriod"):
             node = card.get(key) or {}
             if node.get("startDate"):
                 return str(node["startDate"])[:10]
-        tid = card.get("tenderID") or ""
-        return tid[3:13] if len(tid) > 13 else ""
+        return ""
+
+    @property
+    def _stop_before(self) -> str:
+        """Дата, глибше за яку гортати вже немає сенсу."""
+        return (_as_date(self._date_from) - timedelta(days=LOOKBACK_SLACK_DAYS)).isoformat()
 
     # --- крок 1: пошук ----------------------------------------------------
 
     def discover(self) -> dict[str, dict]:
         """Гортає пошук порталу і повертає ``{tenderID: картка}`` у межах періоду."""
-        codes = self._cpv_codes()
-        queries: list[dict] = []
-        base = {
-            "text": self.p.text or "",
-            "tenderer": [e for e in (self.p.tenderers or []) if e],
-            "buyer": [e for e in (self.p.buyers or []) if e],
-            "status": list(self.p.statuses or []),
-            "proc_type": list(self.p.methods or []),
-        }
-        if codes:
-            # Пошуковий API шукає точний код, тому кожен код — окремий запит.
-            queries = [{**base, "cpv": [code]} for code in codes]
-        else:
-            queries = [base]
-
-        self._log("info", f"Пошук: {len(queries)} запит(ів) до порталу, період "
-                          f"{self._date_from} … {self._date_to}.")
-        cards: dict[str, dict] = {}
-        done = 0
-
-        def run_query(query: dict) -> dict[str, dict]:
-            local: dict[str, dict] = {}
-            stale = 0
-            try:
-                for page, total, rows in self.search.pages("tenders", **query):
-                    if not rows:
-                        break
-                    if page == 1 and total >= SEARCH_MAX_RESULTS:
-                        self._log("warn", f"За ДК021 {query.get('cpv')} пошук віддає щонайбільше "
-                                          f"10 000 записів. Якщо період довгий, частина закупівель "
-                                          f"може не потрапити — звузьте період або код.")
-                    dates = [self._card_date(row) for row in rows]
-                    newest = max((d for d in dates if d), default="")
-                    for row, published in zip(rows, dates):
-                        tid = row.get("tenderID")
-                        if not tid:
-                            continue
-                        if published and not (self._date_from <= published <= self._date_to):
-                            continue
-                        local[tid] = row
-                    # Порожній `newest` означає, що дати визначити не вдалося:
-                    # гортати далі наосліп безглуздо, тож рахуємо це застарілим.
-                    if not newest or newest < self._date_from:
-                        stale += 1
-                        if stale >= STALE_PAGE_TOLERANCE:
-                            break
-                    else:
-                        stale = 0
-            except Cancelled:
-                raise
-            except Exception as exc:
-                self._log("error", f"Помилка пошуку {query.get('cpv') or ''}: {exc}")
-            return local
-
-        with ThreadPoolExecutor(self.s.search_concurrency) as pool:
-            futures = [pool.submit(run_query, q) for q in queries]
-            for future in as_completed(futures):
-                done += 1
-                cards.update(future.result())
-                self._progress("Пошук закупівель", done, len(queries))
-                if done % 5 == 0:
-                    self._tick()
-        self.result.found = len(cards)
-        self._log("info", f"Знайдено закупівель за фільтром: {len(cards):,}".replace(",", " "))
-        self._tick()
-        return cards
+        return _Discovery(self).run()
 
     # --- крок 2: розпізнавання UUID --------------------------------------
 
     def resolve(self, tender_ids: list[str]) -> dict[str, str]:
+        """``tenderID`` → внутрішній UUID, потрібний Центральній базі.
+
+        Способів два, і вони мають протилежну вартість:
+
+        * **прямий розв'язувач порталу** — один запит на закупівлю, влучність
+          стовідсоткова, але витрачає квоту порталу (58 запитів на хвилину);
+        * **повний індекс** — обхід стрічки змін ЦБД за період. Квоти не
+          витрачає зовсім, зате коштує пропорційно довжині періоду, а не
+          розміру вибірки: за добу в стрічці близько 13 тисяч записів.
+
+        Тому вибираємо за розміром: поки закупівель менше, ніж коштує індекс,
+        дешевше опитати кожну; далі виграє індекс.
+
+        Раніше тут був третій шлях — через пошук договорів. Заміряно, що він
+        витіснений обома: на тій самій вибірці з 504 закупівель він разом з
+        індексом дав ті самі 477 за 80 секунд і 19 запитів до порталу, тоді як
+        сам лише індекс дав ті самі 477 за 13 секунд і без жодного запиту.
+        Він ще й знаходив тільки ті закупівлі, за якими договір уже укладено.
+        """
         mapping = self.resolver.from_index(tender_ids)
         if mapping:
-            self._log("info", f"З локального індексу розпізнано {len(mapping):,}."
-                      .replace(",", " "))
+            self._log("info", f"З локального індексу розпізнано {_spaced(len(mapping))}.")
         missing = [t for t in tender_ids if t not in mapping]
+        mode = self.s.resolve_mode
 
-        if missing and self.s.resolve_mode in ("auto", "contracts"):
-            codes = self._cpv_codes()
-            # Гуртовий збір коштує один запит на двадцять закупівель, точковий —
-            # один на кожну, а портал обмежує темп до одиниць запитів на секунду.
-            # Тому щойно закупівель більше, ніж записів на сторінці, йдемо гуртом.
-            harvested = bool(codes) and len(missing) > SEARCH_PAGE_SIZE
-            if harvested:
-                mapping.update(self._harvest_contracts(set(missing), codes))
-                missing = [t for t in tender_ids if t not in mapping]
-            elif missing:
-                # Точково має сенс лише тоді, коли гуртом було нічим: без коду
-                # ДК021 (наприклад, пошук суто за ЄДРПОУ конкурента). Після
-                # гуртового проходу той самий індекс договорів уже переглянуто.
-                mapping.update(self.resolver.from_contracts_search(missing, self._progress))
+        if missing and mode in ("auto", "summary"):
+            if mode == "summary" or len(missing) <= self._summary_budget():
+                self._log("info", f"Розпізнаю {_spaced(len(missing))} закупівель "
+                                  f"напряму через портал.")
+                mapping.update(self.resolver.from_summary(missing, self._progress))
                 missing = [t for t in tender_ids if t not in mapping]
 
-        if missing and self.s.resolve_mode in ("auto", "index"):
-            if self.s.resolve_mode == "index" or len(missing) > 0.4 * max(1, len(tender_ids)):
-                self._log("info", f"Лишилося нерозпізнаних: {len(missing):,}. "
-                                  f"Будую індекс стрічки змін ЦБД.".replace(",", " "))
-                builder = IndexBuilder(
-                    self.client, self.db, shards=self.s.index_concurrency,
-                    on_log=self._log, keep_all=self.s.keep_full_index, wanted=set(missing),
-                )
-                builder.build(_as_date(self._date_from), date.today(), self._progress)
-                mapping.update(self.resolver.from_index(missing))
+        if missing and mode in ("auto", "index"):
+            self._log("info", f"Лишилося нерозпізнаних: {_spaced(len(missing))}. "
+                              f"Будую індекс стрічки змін ЦБД.")
+            builder = IndexBuilder(
+                self.client, self.db, shards=self.s.index_concurrency,
+                on_log=self._log, keep_all=self.s.keep_full_index, wanted=set(missing),
+            )
+            builder.build(_as_date(self._date_from), date.today(), self._progress)
+            mapping.update(self.resolver.from_index(missing))
+            missing = [t for t in tender_ids if t not in mapping]
+
+            # Кількох закупівель у стрічці змін не буває — зазвичай це щойно
+            # оголошені. Портал їх знає, і Центральна база картку віддає, тож
+            # решту добираємо поштучно: на місячному періоді це десятки
+            # запитів, які піднімають повноту з 98% до 100%.
+            if missing and len(missing) <= self._summary_budget():
+                self._log("info", f"Добираю {_spaced(len(missing))} закупівель, яких "
+                                  f"немає у стрічці змін, напряму через портал.")
+                mapping.update(self.resolver.from_summary(missing, self._progress))
                 missing = [t for t in tender_ids if t not in mapping]
 
         self.result.resolved = len(mapping)
         self.result.unresolved = missing
         if missing:
             self._log("warn",
-                      f"Розпізнано {len(mapping)} із {len(tender_ids)} закупівель. "
-                      f"Решта {len(missing)} — це ті, за якими ще немає договору: "
-                      f"звіти без вкладень, скасовані та ті, що тривають. "
-                      f"Щоб охопити і їх, побудуйте локальний індекс у налаштуваннях — "
-                      f"він працює через Центральну базу, де немає обмеження темпу.")
+                      f"Розпізнано {_spaced(len(mapping))} із {_spaced(len(tender_ids))} "
+                      f"закупівель. Решта {len(missing)} не знайшлася ні у стрічці змін "
+                      f"Центральної бази, ні поштучно на порталі — таке буває з "
+                      f"чернетками та щойно скасованими.")
         self._tick()
         return mapping
 
-    def _harvest_contracts(self, wanted: set[str], codes: list[str]) -> dict[str, str]:
-        """Гуртом збирає UUID договорів через пошук — 1 запит на 20 закупівель."""
-        self._log("info", "Збираю UUID через пошук договорів…")
-        contract_uuids: dict[str, str] = {}
-        done = 0
+    def _summary_budget(self) -> int:
+        """Скільки закупівель ще дешевше опитати поштучно, ніж будувати індекс.
 
-        def run(code: str) -> dict[str, str]:
-            local: dict[str, str] = {}
-            stale = 0
-            try:
-                for _page, _total, rows in self.search.pages(
-                        "contracts", cpv=[code], text=self.p.text or ""):
-                    if not rows:
-                        break
-                    newest = ""
-                    for row in rows:
-                        contract_id = row.get("contractID") or ""
-                        # Дата підписання буває порожня — тоді орієнтуємось
-                        # на дату в номері закупівлі (UA-РРРР-ММ-ДД-…).
-                        signed = str(row.get("dateSigned") or "")[:10] or contract_id[3:13]
-                        newest = max(newest, signed)
-                        tid = tender_id_of(contract_id)
-                        if tid in wanted and row.get("id"):
-                            local[tid] = row["id"]
-                    if not newest or newest < self._date_from:
-                        stale += 1
-                        if stale >= STALE_PAGE_TOLERANCE:
-                            break
-                    else:
-                        stale = 0
-            except Cancelled:
-                raise
-            except Exception as exc:
-                self._log("warn", f"Пошук договорів {code}: {exc}")
-            return local
-
-        with ThreadPoolExecutor(self.s.search_concurrency) as pool:
-            futures = [pool.submit(run, code) for code in codes]
-            for future in as_completed(futures):
-                done += 1
-                contract_uuids.update(future.result())
-                self._progress("Пошук договорів", done, len(codes))
-        if not contract_uuids:
-            return {}
-        return self.resolver.from_contract_uuids(contract_uuids.values(), self._progress)
+        Індекс коштує ``діб × 13 000 / 8 500`` секунд, прямий розв'язувач —
+        ``закупівель × 60/58`` секунд. Прирівнявши, дістаємо приблизно півтори
+        закупівлі на добу періоду. Числа виміряні на живих API; точність тут не
+        потрібна — важливо не переплутати порядок величини.
+        """
+        days = max(1, (_as_date(self._date_to) - _as_date(self._date_from)).days + 1)
+        return int(days * 1.5)
 
     # --- крок 3: повні картки --------------------------------------------
 
@@ -309,7 +266,7 @@ class Pipeline:
             except Exception as exc:
                 self._log("warn", f"{tender_id}: не вдалося прочитати картку — {exc}")
                 return None
-            parsed = parse_tender(data)
+            parsed = parse_tender(data, keep_urls=self.p.download_files)
             if not self._passes_filters(parsed):
                 return None
             self.db.save_tender(
@@ -335,12 +292,14 @@ class Pipeline:
                 if row:
                     rows.append(row)
                     self._on_tender(row)
+                    # Плитка має рости разом із роботою, а не стрибнути в кінці.
+                    self.result.tenders_loaded = len(rows)
                 self._progress("Завантаження карток закупівель", done, total)
-                if done % 10 == 0:
+                if done % 5 == 0:
                     self._tick()
         self.result.tenders_loaded = len(rows)
-        self._log("info", f"Завантажено карток: {len(rows):,}, документів у них: "
-                          f"{self.result.documents:,}".replace(",", " "))
+        self._log("info", f"Завантажено карток: {_spaced(len(rows))}, документів у них: "
+                          f"{_spaced(self.result.documents)}")
         self._tick()
         return rows
 
@@ -539,7 +498,11 @@ class Pipeline:
                 self._log("warn", f"Картка {pid[:8]}…: {exc}")
                 done += 1
                 continue
-            row, specs = parse_product(card, brief.get(pid))
+            # Назву категорії картка тримає кодом — розкриваємо її окремо
+            # (відповіді кешуються, тож на сотні товарів це кілька запитів).
+            row, specs = parse_product(
+                card, brief.get(pid),
+                category_title=self.market.category_title(card.get("relatedCategory") or ""))
             row["fetched_at"] = datetime.now().isoformat(timespec="seconds")
             self.db.save_product(row, specs)
             saved += 1
@@ -548,9 +511,9 @@ class Pipeline:
             if done % 20 == 0:
                 self._tick()
         self.result.products = saved + skipped
-        self._log("info", f"Картки товарів: збережено {saved:,}, усього в базі "
-                          f"{self.db.scalar('SELECT COUNT(*) FROM products') or 0:,}"
-                  .replace(",", " "))
+        in_base = self.db.scalar("SELECT COUNT(*) FROM products") or 0
+        self._log("info", f"Картки товарів: збережено {_spaced(saved)}, "
+                          f"усього в базі {_spaced(in_base)}")
         self._tick()
         return saved
 
@@ -563,7 +526,7 @@ class Pipeline:
         sheets = build_sheets(self.db)
         if not sheets:
             return None
-        path = export_path("prozorro-дані")
+        path = export_path("prozorro-дані", folder=self.s.output_dir)
         try:
             write_xlsx(path, sheets)
         except Exception as exc:
@@ -572,7 +535,7 @@ class Pipeline:
         self.result.table = str(path)
         rows = sum(len(r) for _h, r in sheets.values())
         self._log("info", f"Таблиця: {path.name} — {len(sheets)} аркушів, "
-                          f"{rows:,} рядків.".replace(",", " "))
+                          f"{_spaced(rows)} рядків.")
         self._tick()
         return path
 
@@ -582,6 +545,13 @@ class Pipeline:
         job_id = self.db.job_start(self.p.to_dict())
         status = "ok"
         try:
+            if self.s.fresh_start:
+                removed = self.db.reset_collected()
+                if removed:
+                    total = sum(removed.values())
+                    self._log("info", f"Базу очищено перед збором: прибрано "
+                                      f"{total:,} рядків попередніх вибірок."
+                              .replace(",", " "))
             cards = self.discover()
             if not cards:
                 self._log("warn", "За заданими фільтрами нічого не знайдено.")
@@ -631,6 +601,257 @@ def _write_json(folder: Path, tender_id: str, data: dict) -> None:
             json.dump(data, fh, ensure_ascii=False, indent=1)
     except (OSError, ValueError, TypeError):
         pass
+
+
+
+class _Discovery:
+    """Крок пошуку: складання плану запитів і гортання видачі.
+
+    Винесено з :meth:`Pipeline.discover` окремим об'єктом, бо крок має власний
+    стан — знайдені картки, лічильник сторінок, оцінку плану, — і разом із ним
+    метод розростався до двохсот рядків.
+
+    Пошук має дві властивості, які й визначають усю будову кроку:
+
+    * кілька кодів ДК021 в одному запиті об'єднуються через **АБО**, тож увесь
+      набір іде одним запитом, а не запитом на кожен код;
+    * видача **обрізана 500 сторінками (10 000 записів)**, і ця стеля спільна
+      для всього запиту.
+
+    Через стелю один запит може просто не дістати до початку періоду. Раніше це
+    з'ясовувалося аж після 500 сторінок гортання — тобто після восьми хвилин
+    квоти, — і тоді набір ділився навпіл, а половини гортали те саме наново. На
+    річному періоді це давало години марної роботи.
+
+    Тепер глибина з'ясовується :meth:`_probe` — двома запитами: сторінки
+    адресуються номером, тож досить спитати останню доступну й подивитися її
+    дату.
+    """
+
+    def __init__(self, pipe: "Pipeline"):
+        self.pipe = pipe
+        self.codes = pipe._cpv_codes()
+        self.methods = list(pipe.p.methods or [])
+        self.base = {
+            "text": pipe.p.text or "",
+            "tenderer": [e for e in (pipe.p.tenderers or []) if e],
+            "buyer": [e for e in (pipe.p.buyers or []) if e],
+            "status": list(pipe.p.statuses or []),
+        }
+        self.cards: dict[str, dict] = {}
+        #: Скільки сторінок пройдено і скільки їх очікується; верхню оцінку
+        #: дає проба, бо разом із нею приходить `total`.
+        self.pages = 0
+        self.planned = 0
+        #: Оцінка сторінок за вмістом плану — не за ``id()`` об'єкта: відкинуті
+        #: плани збирає складальник сміття, і той самий ``id()`` міг би
+        #: дістатися новому кортежу.
+        self.page_hint: dict[tuple, int] = {}
+
+    # --- службове ---------------------------------------------------------
+
+    def _query_of(self, plan) -> dict:
+        """Аргументи запиту для плану.
+
+        Тіло з них складає :meth:`SearchApi.build_body` — і проба, і гортання
+        мусять іти через нього: він відкидає порожні поля, а сервер порожній
+        ``status`` чи ``text`` відхиляє з HTTP 422.
+        """
+        batch, procs = plan
+        q = dict(self.base)
+        if batch:
+            q["cpv"] = list(batch)
+        if procs:
+            q["proc_type"] = list(procs)
+        return q
+
+    @staticmethod
+    def _describe(plan) -> str:
+        batch, procs = plan
+        what = f"{len(batch)} код(ів)" if batch else "без кодів"
+        return f"{what}, {procs[0]}" if len(procs) == 1 else what
+
+    @staticmethod
+    def _key(plan) -> tuple:
+        batch, procs = plan
+        return (tuple(batch), tuple(procs))
+
+    def _ask(self, plan, page: int) -> dict:
+        body = SearchApi.build_body(page=page, **self._query_of(plan))
+        data = self.pipe.search.query("tenders", body)
+        with self.pipe._lock:
+            self.pages += 1
+        return data
+
+    def _note(self, stage: str = "Пошук закупівель") -> None:
+        pipe = self.pipe
+        with pipe._lock:
+            pipe.result.found = len(self.cards)
+            done, planned = self.pages, self.planned
+        pipe._progress(stage, done, max(planned, done + 1))
+        pipe._tick()
+
+    # --- фаза 1: план -----------------------------------------------------
+
+    def _probe(self, plan) -> tuple[bool, int]:
+        """``(чи покриє план період, скільки сторінок він займе)``.
+
+        Перший запит дає ``total``, другий — дату на останній доступній
+        сторінці. Якщо записів менше за стелю, другий запит не потрібен.
+        """
+        first = self._ask(plan, 1)
+        total = int(first.get("total") or 0)
+        pages = max(1, min(SEARCH_MAX_PAGE, -(-total // SEARCH_PAGE_SIZE)))
+        self.page_hint[self._key(plan)] = pages
+        if total < SEARCH_MAX_RESULTS:
+            return True, pages
+        last = self._ask(plan, pages)
+        deepest = min((d for d in (self.pipe._published(r) for r in last.get("data") or []) if d),
+                      default="")
+        return (not deepest or deepest <= self.pipe._date_from), pages
+
+    def _refine(self, plan) -> list | None:
+        """Уточнює план, який не дістає до початку періоду.
+
+        Спершу ділимо коди — це найдешевше й завжди коректно. Коли код лишився
+        один, беремо інший розріз: тип процедури. Він розбиває видачу без
+        перетинів (перевірено) і дає глибину на роки замість місяців, бо стеля
+        рахується для кожного запиту окремо.
+        """
+        batch, procs = plan
+        if len(batch) > 1:
+            half = len(batch) // 2
+            return [(batch[:half], procs), (batch[half:], procs)]
+        if procs:
+            return None
+        pool = self.methods or list(METHOD_LABELS)
+        usable = [m for m in pool if len(m) <= PROC_TYPE_MAX_LEN]
+        for skipped in (m for m in pool if len(m) > PROC_TYPE_MAX_LEN):
+            self.pipe._log("warn", f"Процедуру «{METHOD_LABELS.get(skipped, skipped)}» "
+                                   f"пошук не приймає: її назва довша за "
+                                   f"{PROC_TYPE_MAX_LEN} символів. Такі закупівлі до "
+                                   f"вибірки не потраплять — їх одиниці.")
+        return [(batch, [m]) for m in usable] if len(usable) > 1 else None
+
+    def _plan_out(self, plan) -> list | None:
+        """Проба → або план готовий до гортання, або його треба уточнити."""
+        covers, _pages = self._probe(plan)
+        if covers:
+            return None
+        parts = self._refine(plan)
+        if parts:
+            return parts
+        self.pipe._log("warn", f"Запит ({self._describe(plan)}) віддає щонайбільше "
+                               f"{_spaced(SEARCH_MAX_RESULTS)} записів, і їх не вистачає "
+                               f"на весь період. Частина закупівель не потрапить — "
+                               f"звузьте період або перелік кодів.")
+        return None
+
+    def _build_plan(self) -> list:
+        """Складає перелік запитів, готових до гортання.
+
+        Спершу з'ясовуємо глибину всіх запитів і лише потім гортаємо: так до
+        початку гортання відома загальна кількість сторінок, а отже смуга
+        показує чесний відсоток. Планування коштує один-два запити на план — на
+        річному періоді це близько тридцяти запитів за кілька секунд.
+        """
+        pipe = self.pipe
+        plans = deque([(list(self.codes), self.methods)])
+        ready: list = []
+        with ThreadPoolExecutor(pipe.s.search_concurrency) as pool:
+            while plans:
+                wave = [plans.popleft()
+                        for _ in range(min(len(plans), pipe.s.search_concurrency))]
+                futures = {pool.submit(self._plan_out, plan): plan for plan in wave}
+                for future in as_completed(futures):
+                    plan = futures[future]
+                    parts = future.result()
+                    if parts:
+                        pipe._log("info", f"Запит ({self._describe(plan)}) не дістає до "
+                                          f"початку періоду — ділю на {len(parts)}.")
+                        plans.extend(parts)
+                    else:
+                        ready.append(plan)
+                    self._note("Планую пошук")
+        with pipe._lock:
+            self.planned = self.pages + sum(self.page_hint.get(self._key(p), 1)
+                                            for p in ready)
+        pipe._log("info", f"План пошуку: {len(ready)} запит(ів), "
+                          f"до {_spaced(self.planned - self.pages)} сторінок.")
+        return ready
+
+    # --- фаза 2: гортання -------------------------------------------------
+
+    def _keep(self, rows) -> tuple[list, list]:
+        """Ділить сторінку на «беремо» та перелік дат для рішення про зупинку."""
+        keep, stream = [], []
+        for row in rows:
+            published = self.pipe._published(row)
+            if published:
+                stream.append(published)
+            tid = row.get("tenderID")
+            if not tid:
+                continue
+            if published and not (self.pipe._date_from <= published <= self.pipe._date_to):
+                continue
+            keep.append((tid, row))
+        return keep, stream
+
+    def _walk(self, plan) -> None:
+        """Гортає план до початку періоду, складаючи знайдене у спільний набір."""
+        pipe = self.pipe
+        stale = 0
+        try:
+            for _page, _total, rows in pipe.search.pages("tenders", **self._query_of(plan)):
+                with pipe._lock:
+                    self.pages += 1
+                if not rows:
+                    break
+                keep, stream = self._keep(rows)
+                with pipe._lock:
+                    self.cards.update(keep)
+                self._note()
+                newest = max(stream, default="")
+                # Порожній `newest` означає, що дати визначити не вдалося:
+                # гортати далі наосліп безглуздо, тож рахуємо це застарілим.
+                if not newest or newest < pipe._stop_before:
+                    stale += 1
+                    if stale >= STALE_PAGE_TOLERANCE:
+                        break
+                else:
+                    stale = 0
+        except Cancelled:
+            raise
+        except Exception as exc:
+            pipe._log("error", f"Помилка пошуку ({self._describe(plan)}): {exc}")
+
+    # --- усе разом --------------------------------------------------------
+
+    def run(self) -> dict[str, dict]:
+        pipe = self.pipe
+        pipe._log("info", f"Пошук: {len(self.codes) or '—'} код(ів) ДК021, період "
+                          f"{pipe._date_from} … {pipe._date_to}.")
+        ready = self._build_plan()
+        with ThreadPoolExecutor(pipe.s.search_concurrency) as pool:
+            for _ in pool.map(self._walk, ready):
+                pipe._tick()
+        pipe.result.found = len(self.cards)
+        pipe._progress("Пошук закупівель", self.pages, self.pages)
+        pipe._log("info", f"Знайдено закупівель за фільтром: {_spaced(len(self.cards))} "
+                          f"(сторінок пройдено: {_spaced(self.pages)})")
+        pipe._tick()
+        return self.cards
+
+
+def _spaced(number) -> str:
+    """``12345`` → ``12 345``.
+
+    Раніше тисячі відокремлювали через ``f"…{n:,}…".replace(",", " ")``, але
+    заміна зачіпала весь рядок — і звичайні коми в тексті теж ставали
+    пробілами («знайдено 20 закупівель, з них…» → «…закупівель з них…»).
+    Тут заміна стосується лише числа.
+    """
+    return f"{number:,}".replace(",", " ")
 
 
 def _as_date(value: str) -> date:

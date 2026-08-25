@@ -1,0 +1,58 @@
+{
+  "output_dir": "C:\\Users\\Sasha\\AppData\\Local\\Temp\\tmp7sxvsan7\\out",
+  "own_edrpou": [
+    "41263186",
+    "44728541"
+  ],
+  "competitors": [
+    "24083083",
+    "40733799",
+    "40175293",
+    "42893689"
+  ],
+  "search_concurrency": 2,
+  "detail_concurrency": 16,
+  "download_concurrency": 8,
+  "index_concurrency": 8,
+  "request_timeout": 60,
+  "max_retries": 4,
+  "rate_limit_rps": 12.0,
+  "max_file_mb": 0,
+  "skip_existing": true,
+  "download_all_versions": false,
+  "resolve_mode": "auto",
+  "fresh_start": true,
+  "save_tender_json": true,
+  "keep_full_index": true,
+  "theme": "dark",
+  "preset": {
+    "name": "За замовчуванням",
+    "date_from": "2026-02-25",
+    "date_to": "2026-08-26",
+    "cpv_prefixes": [
+      "3021"
+    ],
+    "cpv_codes": [],
+    "text": "",
+    "tenderers": [],
+    "buyers": [],
+    "statuses": [],
+    "methods": [],
+    "regions": [],
+    "value_min": null,
+    "value_max": null,
+    "doc_scopes": [
+      "tender",
+      "bid",
+      "award",
+      "contract",
+      "other"
+    ],
+    "skip_signatures": true,
+    "only_extensions": [],
+    "download_files": false,
+    "collect_market": true,
+    "market_active_only": true
+  },
+  "saved_presets": []
+}

@@ -317,7 +317,14 @@ class SearchPage(QWidget):
         self.btn_files.setEnabled(not running)
         self.btn_count.setEnabled(not running)
         self.btn_stop.setEnabled(running)
-        if not running:
+        if running:
+            # Перший звіт про поступ прийде аж після першої сторінки видачі,
+            # а до того вікно показувало б «Готово до роботи» — наче ніщо й
+            # не запустилося. Тому вмикаємо «живу» смугу одразу.
+            self.progress.setRange(0, 0)
+            self.progress.setFormat("Запускаємо…")
+        else:
+            self.progress.setRange(0, 100)
             self.progress.setFormat("Готово до роботи")
             self.progress.setValue(0)
 

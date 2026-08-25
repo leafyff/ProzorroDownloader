@@ -17,6 +17,9 @@ Sheet = tuple[Sequence[str], list[list[Any]]]
 #: Пояснення до кожного аркуша — потрапляє першим аркушем книги.
 SHEET_NOTES = {
     "Закупівлі": "Одна закупівля — один рядок. Ключ для зв'язку з іншими аркушами — «Номер закупівлі».",
+    "Лоти": "Лоти закупівель. У закупівлі без поділу на лоти цього рядка не буде.",
+    "Номенклатура": "Позиції закупівель: товар, код ДК021, кількість і ціна за одиницю. "
+                    "Основа для аналізу товару та торгових марок.",
     "Пропозиції": "Хто подавався і з якою сумою. Видно лише там, де процедура розкриває пропозиції.",
     "Переможці": "Рішення про визначення переможця.",
     "Договори": "Укладені договори з ЄДРПОУ постачальника й сумою.",
@@ -49,6 +52,50 @@ def tenders(db: Database) -> Sheet:
             (r["tender_start"] or "")[:10], (r["tender_end"] or "")[:10],
             (r["date_modified"] or "")[:10],
             f"https://prozorro.gov.ua/tender/{r['tender_id']}",
+        ])
+    return headers, rows
+
+
+def lots(db: Database) -> Sheet:
+    headers = ["Номер закупівлі", "Лот", "Опис лоту", "Статус лоту",
+               "Очікувана вартість лоту", "Валюта"]
+    rows = [[r["tender_id"], r["title"], r["description"], r["status"],
+             r["value_amount"], r["currency"]]
+            for r in db.query("""
+                SELECT t.tender_id, l.* FROM lots l
+                JOIN tenders t ON t.uuid = l.tender_uuid
+                ORDER BY t.date_created DESC""")]
+    return headers, rows
+
+
+def items(db: Database) -> Sheet:
+    """Номенклатура закупівель — найцінніший аркуш для аналізу товару.
+
+    Саме тут лежить опис позиції з назвою моделі й торговою маркою, код ДК021
+    на рівні конкретного товару та ціна за одиницю. Без цього аркуша аналітика
+    бачить лише узагальнений предмет закупівлі й не може сказати, з чим саме
+    конкурент виходить на торги.
+    """
+    headers = ["Номер закупівлі", "Дата", "Позиція", "Код ДК021", "Назва коду",
+               "Кількість", "Одиниця", "Очікувана вартість лоту", "Ціна за одиницю",
+               "Замовник", "ЄДРПОУ замовника", "Регіон"]
+    rows = []
+    for r in db.query("""
+            SELECT t.tender_id, t.date_created, t.pe_name, t.pe_edrpou, t.pe_region,
+                   i.description, i.cpv, i.cpv_name, i.quantity, i.unit,
+                   COALESCE(l.value_amount, t.value_amount) AS lot_value
+            FROM items i
+            JOIN tenders t ON t.uuid = i.tender_uuid
+            LEFT JOIN lots l ON l.id = i.lot_id
+            ORDER BY t.date_created DESC"""):
+        quantity = r["quantity"] or 0
+        lot_value = r["lot_value"] or 0
+        unit_price = round(lot_value / quantity, 2) if quantity and lot_value else None
+        rows.append([
+            r["tender_id"], (r["date_created"] or "")[:10], r["description"],
+            r["cpv"], r["cpv_name"], r["quantity"], r["unit"],
+            lot_value or None, unit_price,
+            r["pe_name"], r["pe_edrpou"], r["pe_region"],
         ])
     return headers, rows
 
@@ -144,6 +191,8 @@ def product_specs(db: Database) -> Sheet:
 #: Порядок аркушів у книзі.
 BUILDERS = {
     "Закупівлі": tenders,
+    "Лоти": lots,
+    "Номенклатура": items,
     "Пропозиції": bids,
     "Переможці": awards,
     "Договори": contracts,

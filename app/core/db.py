@@ -301,8 +301,31 @@ class Database:
 
     # --- закупівлі --------------------------------------------------------
 
-    def tender_exists(self, uuid: str) -> bool:
-        return self.scalar("SELECT 1 FROM tenders WHERE uuid=?", (uuid,)) is not None
+    #: Таблиці зі зібраними картками. Індекс tenderID→UUID і покриття стрічки
+    #: змін сюди не входять: вони здобуваються дорого й від предмета збору не
+    #: залежать, тож переживають очищення.
+    COLLECTED = ("documents", "contracts", "awards", "bids", "items", "lots",
+                 "tenders", "product_specs", "products")
+
+    def reset_collected(self) -> dict[str, int]:
+        """Прибирає зібрані картки, лишаючи індекс і журнал запусків.
+
+        Без цього база стає архівом усіх колишніх пошуків, і аналітика рахує
+        ринок по суміші: закупівлі ІТ-техніки разом із залишками попереднього
+        збору за іншим класом ДК021. Одна вибірка — один збір.
+        """
+        removed: dict[str, int] = {}
+        with self._lock:
+            for table in self.COLLECTED:
+                count = self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                if count:
+                    removed[table] = count
+                self.conn.execute(f"DELETE FROM {table}")
+            self.conn.commit()
+            # Місце, звільнене видаленням, SQLite сам не віддає — а йдеться про
+            # сотні мегабайтів.
+            self.conn.execute("VACUUM")
+        return removed
 
     def save_tender(self, row: dict, *, lots: list, items: list, bids: list,
                     awards: list, contracts: list, docs: list) -> None:

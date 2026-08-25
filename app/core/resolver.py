@@ -16,10 +16,10 @@ from __future__ import annotations
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from typing import Callable, Iterable
 
-from .api import CdbApi, SearchApi
+from .api import SUMMARY_URL, CdbApi, SearchApi
 from .db import Database
 from .http import Cancelled, HttpClient
 
@@ -53,61 +53,35 @@ class Resolver:
     def from_index(self, tender_ids: Iterable[str]) -> dict[str, str]:
         return self.db.index_lookup(list(tender_ids))
 
-    # --- 2. через договори -----------------------------------------------
+    # --- 2. прямий розв'язувач порталу ------------------------------------
 
-    def from_contract_uuids(self, contract_uuids: Iterable[str],
-                            progress: ProgressCb | None = None) -> dict[str, str]:
-        """``{tenderID: uuid закупівлі}`` за списком UUID договорів."""
-        uuids = list(dict.fromkeys(contract_uuids))
-        found: dict[str, str] = {}
-        done = 0
+    def from_summary(self, tender_ids: Iterable[str],
+                     progress: ProgressCb | None = None) -> dict[str, str]:
+        """``{tenderID: uuid}`` — по одному запиту на закупівлю.
 
-        def worker(cuuid: str) -> tuple[str, str] | None:
-            try:
-                data = self.cdb.contract(cuuid)
-            except Cancelled:
-                raise
-            except Exception as exc:
-                self._log("warn", f"Не вдалося прочитати договір {cuuid[:8]}…: {exc}")
-                return None
-            tuuid = data.get("tender_id") or ""
-            tid = tender_id_of(data.get("contractID") or "")
-            return (tid, tuuid) if tid and tuuid else None
+        Портал приймає людський номер напряму (:data:`SUMMARY_URL`) і віддає
+        картку з внутрішнім ``id``. Влучність — стовідсоткова, на відміну від
+        колишнього шляху через договори, який знаходив лише ті закупівлі, за
+        якими договір уже є.
 
-        with ThreadPoolExecutor(self.concurrency) as pool:
-            futures = [pool.submit(worker, u) for u in uuids]
-            for future in as_completed(futures):
-                done += 1
-                result = future.result()
-                if result:
-                    found[result[0]] = result[1]
-                if progress and done % 10 == 0:
-                    progress("Розпізнавання закупівель за договорами", done, len(uuids))
-        if progress:
-            progress("Розпізнавання закупівель за договорами", len(uuids), len(uuids))
-        self._store(found)
-        return found
-
-    def from_contracts_search(self, tender_ids: Iterable[str],
-                              progress: ProgressCb | None = None) -> dict[str, str]:
-        """Точковий пошук договору за номером закупівлі (для решти, що лишилася)."""
+        Ціна — квота порталу: один запит на закупівлю з 58 доступних на
+        хвилину. Тому спосіб вигідний лише для невеликих вибірок; вибір між
+        ним і повним індексом робить :meth:`Pipeline.resolve`.
+        """
         ids = list(dict.fromkeys(tender_ids))
         found: dict[str, str] = {}
         done = 0
 
         def worker(tid: str) -> tuple[str, str] | None:
             try:
-                data = self.search.query("contracts", {"page": 1, "text": tid})
-                for row in data.get("data") or []:
-                    if tender_id_of(row.get("contractID") or "") == tid and row.get("id"):
-                        contract = self.cdb.contract(row["id"])
-                        if contract.get("tender_id"):
-                            return tid, contract["tender_id"]
+                data = self.client.get_json(SUMMARY_URL.format(tender_id=tid))
             except Cancelled:
                 raise
             except Exception as exc:
-                self._log("warn", f"{tid}: пошук договору не вдався — {exc}")
-            return None
+                self._log("warn", f"{tid}: картку не знайдено — {exc}")
+                return None
+            uuid = (data or {}).get("id") or ""
+            return (tid, uuid) if uuid else None
 
         with ThreadPoolExecutor(self.search_concurrency) as pool:
             futures = [pool.submit(worker, tid) for tid in ids]
@@ -116,10 +90,8 @@ class Resolver:
                 result = future.result()
                 if result:
                     found[result[0]] = result[1]
-                if progress and done % 10 == 0:
-                    progress("Пошук закупівель за номером договору", done, len(ids))
-        if progress:
-            progress("Пошук закупівель за номером договору", len(ids), len(ids))
+                if progress:
+                    progress("Розпізнавання закупівель", done, len(ids))
         self._store(found)
         return found
 
@@ -156,12 +128,37 @@ class IndexBuilder:
 
     @staticmethod
     def month_chunks(since: date, until: date) -> list[tuple[date, date]]:
+        """Період помісячно. Лишено для сумісності; ``build`` бере :meth:`date_chunks`."""
         chunks: list[tuple[date, date]] = []
         cur = since.replace(day=1)
         while cur <= until:
             nxt = (cur.replace(day=28) + timedelta(days=4)).replace(day=1)
             chunks.append((max(cur, since), min(nxt - timedelta(days=1), until)))
             cur = nxt
+        return chunks
+
+    @staticmethod
+    def date_chunks(since: date, until: date, shards: int) -> list[tuple[date, date]]:
+        """Ріже період на відрізки — принаймні по одному на потік.
+
+        Стрічка гортається курсором (``next_page``), тож усередині відрізка
+        паралелізму немає: єдиний спосіб задіяти кілька потоків — дати кожному
+        свій відрізок. Раніше різали строго помісячно, і на короткому періоді
+        виходив один відрізок: вісім діб стрічки гортались одним потоком, хоч
+        у налаштуваннях і стояло чотири. Виміряно, що побудова індексу на 99%
+        складається з очікування мережі, тож саме тут і лежить пришвидшення.
+        """
+        total_days = (until - since).days + 1
+        if total_days <= 0:
+            return []
+        parts = max(1, min(max(1, shards), total_days))
+        size = -(-total_days // parts)          # ділення з округленням угору
+        chunks: list[tuple[date, date]] = []
+        cur = since
+        while cur <= until:
+            end = min(cur + timedelta(days=size - 1), until)
+            chunks.append((cur, end))
+            cur = end + timedelta(days=1)
         return chunks
 
     def missing_days(self, since: date, until: date) -> list[str]:
@@ -179,7 +176,7 @@ class IndexBuilder:
               progress: ProgressCb | None = None) -> int:
         """Будує індекс за період. Повертає кількість записів, доданих цього разу."""
         until = until or date.today()
-        chunks = [c for c in self.month_chunks(since, until)
+        chunks = [c for c in self.date_chunks(since, until, self.shards)
                   if self.missing_days(c[0], c[1])]
         if not chunks:
             self._log("info", "Індекс за цей період уже побудовано.")
@@ -187,10 +184,28 @@ class IndexBuilder:
 
         total_days = sum((c[1] - c[0]).days + 1 for c in chunks)
         done_days = 0
+        seen_records = 0
         self._log("info", f"Побудова індексу: {len(chunks)} відрізків, {total_days} діб.")
 
+        def note() -> None:
+            """Звіт про поступ на кожній сторінці стрічки.
+
+            Повідомляти лише на зміні доби не годиться: відрізок завдовжки в
+            одну добу не змінює її жодного разу, і вікно завмирало б на
+            попередньому етапі на весь час індексації.
+
+            Відсоток рахуємо за завершеними добами, а рух між ними показуємо
+            лічильником записів. Дату в підписі не показуємо навмисно: відрізки
+            обходяться паралельно, і вона стрибала б туди-сюди між потоками.
+            """
+            if not progress:
+                return
+            count = f"{seen_records:,}".replace(",", " ")
+            progress(f"Індексація: {count} записів стрічки",
+                     min(done_days, total_days), total_days)
+
         def worker(chunk: tuple[date, date]) -> int:
-            nonlocal done_days
+            nonlocal done_days, seen_records
             start, end = chunk
             count = 0
             batch: list[tuple] = []
@@ -199,6 +214,9 @@ class IndexBuilder:
                 for rows in self.cdb.feed(start.isoformat()):
                     if not rows:
                         break
+                    with self._lock:
+                        seen_records += len(rows)
+                    note()
                     stop = False
                     for row in rows:
                         modified = (row.get("dateModified") or "")[:10]
@@ -208,10 +226,10 @@ class IndexBuilder:
                         tid = row.get("tenderID")
                         uuid = row.get("id")
                         if tid and uuid and (self.keep_all or (self.wanted and tid in self.wanted)):
-                            batch.append((
-                                tid, uuid, (row.get("dateCreated") or "")[:10], modified,
-                                row.get("status") or "", "", "", "", "",
-                            ))
+                            # Порожні колонки лишаються з часів, коли стрічку
+                            # тягнули з усіма полями; читається лише пара
+                            # tender_id → uuid.
+                            batch.append((tid, uuid, "", modified, "", "", "", "", ""))
                         count += 1
                         if modified and modified != last_day:
                             # Добу можна вважати покритою лише тоді, коли ми
@@ -221,9 +239,7 @@ class IndexBuilder:
                                 if self.keep_all:
                                     self.db.coverage_mark(last_day, 0, True)
                                 done_days += 1
-                                seen = done_days
-                            if progress:
-                                progress(f"Індексація {last_day}", seen, total_days)
+                            note()
                             last_day = modified
                     if len(batch) >= 20000:
                         self.db.index_put(batch)
@@ -243,14 +259,16 @@ class IndexBuilder:
             return count
 
         with ThreadPoolExecutor(min(self.shards, len(chunks))) as pool:
-            futures = [pool.submit(worker, chunk) for chunk in chunks]
+            futures = {pool.submit(worker, chunk): chunk for chunk in chunks}
             for future in as_completed(futures):
                 self.records += future.result()
+                start, end = futures[future]
+                with self._lock:
+                    # Доби всередині відрізка вже полічені на зміні дати;
+                    # лишається остання, якою відрізок і завершується.
+                    done_days = min(total_days, done_days + 1)
+                note()
         if progress:
             progress("Індексацію завершено", total_days, total_days)
         self._log("info", f"Індекс: опрацьовано {self.records:,} записів стрічки.".replace(",", " "))
         return self.records
-
-
-def parse_date(value: str) -> date:
-    return datetime.fromisoformat(value[:10]).date()

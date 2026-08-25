@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
 from .. import APP_NAME, APP_VERSION
 from ..config import Settings
 from ..core.db import Database
+from .pages.analytics_page import AnalyticsPage
 from .pages.files_page import FilesPage
 from .pages.log_page import LogPage
 from .pages.results_page import ResultsPage
@@ -24,6 +25,7 @@ from .workers import CountWorker, DownloadWorker, IndexWorker, MissingFilesWorke
 NAV = [
     ("Пошук і завантаження", "search"),
     ("Результати", "results"),
+    ("Аналітика", "analytics"),
     ("Файли", "files"),
     ("Журнал", "log"),
     ("Налаштування", "settings"),
@@ -52,12 +54,14 @@ class MainWindow(QMainWindow):
 
         self.stack = QStackedWidget()
         self.search_page = SearchPage()
-        self.results_page = ResultsPage(db)
+        self.results_page = ResultsPage(db, lambda: self.s.output_dir)
+        self.analytics_page = AnalyticsPage(settings)
         self.files_page = FilesPage(db, lambda: self.s.output_dir)
         self.log_page = LogPage()
         self.settings_page = SettingsPage(settings, db)
-        for page in (self.search_page, self.results_page, self.files_page,
-                     self.log_page, self.settings_page):
+        # Порядок сторінок має збігатися з NAV — кнопка перемикає стек за індексом.
+        for page in (self.search_page, self.results_page, self.analytics_page,
+                     self.files_page, self.log_page, self.settings_page):
             self.stack.addWidget(page)
         layout.addWidget(self.stack, 1)
         self.setCentralWidget(root)
@@ -111,11 +115,14 @@ class MainWindow(QMainWindow):
 
     def _go(self, index: int) -> None:
         self.stack.setCurrentIndex(index)
-        if index == 1:
+        key = NAV[index][1] if index < len(NAV) else ""
+        if key == "results":
             self.results_page.reload()
-        elif index == 2:
+        elif key == "analytics":
+            self.analytics_page.reload_files()
+        elif key == "files":
             self.files_page.reload()
-        elif index == 4:
+        elif key == "settings":
             self.settings_page.refresh_index_info()
 
     def _wire(self) -> None:
@@ -130,6 +137,9 @@ class MainWindow(QMainWindow):
     def apply_theme(self) -> None:
         self.setStyleSheet(stylesheet(self.s.theme))
         self.setWindowIcon(_app_icon(palette(self.s.theme)["accent"]))
+        # Графіки малюються вручну й про таблицю стилів нічого не знають —
+        # палітру їм треба передати окремо.
+        self.analytics_page.apply_theme()
 
     # --- запуск завдань ---------------------------------------------------
 
@@ -196,6 +206,22 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Нічого завантажувати",
                                     "Усі відомі файли вже на диску.")
             return
+        # Збір «тільки дані» не зберігає посилань на файли: у типовій вибірці це
+        # сотні мегабайтів адрес, які нікуди не ведуть, бо качати ніхто не
+        # збирався. Тож качати нема за чим — треба зібрати наново з файлами.
+        addressable = self.db.scalar(
+            "SELECT COUNT(*) FROM documents WHERE url <> '' "
+            "AND state IN ('pending','filtered','error')") or 0
+        if not addressable:
+            QMessageBox.information(
+                self, "Посилань немає",
+                f"У базі {pending + failed} незавантажених файлів, але без "
+                f"посилань: збір ішов у режимі «тільки дані», і адреси не\n"
+                f"зберігалися.\n\nЩоб отримати файли, запустіть збір кнопкою "
+                f"«Зібрати файли». Назви й типи документів для аналітики при "
+                f"цьому вже є — вони зберігаються завжди.")
+            return
+
         parts = []
         if pending:
             parts.append(f"{pending} ще не завантажених")
@@ -340,6 +366,7 @@ class MainWindow(QMainWindow):
             for worker in running:
                 worker.stop()
                 worker.wait(5000)
+        self.analytics_page.stop()
         self.settings_page.apply()
         self.s.preset = self.search_page.to_preset()
         self.s.save()

@@ -14,6 +14,14 @@ from PySide6.QtWidgets import (
 #: не дає розрізати один довгий номер на два «коди».
 EDRPOU_RE = re.compile(r"(?<!\d)\d{8,10}(?!\d)")
 
+#: Скільки рядків списку ЄДРПОУ показуємо без прокрутки.
+_MIN_ROWS = 2
+_MAX_ROWS = 6
+#: Висота рядка з відступами таблиці стилів. Qt повідомляє її без цих
+#: відступів, і порахований по ній список виходить удвічі нижчим за
+#: намальований — тому беремо більше з двох значень.
+_ROW_HEIGHT = 42
+
 
 def _as_qdate(value: str, fallback: QDate) -> QDate:
     parsed = QDate.fromString(str(value or "")[:10], "yyyy-MM-dd")
@@ -207,7 +215,7 @@ class EdrpouList(QWidget):
         lay.addLayout(row)
 
         self.list = QListWidget()
-        self.list.setMaximumHeight(112)
+        self.list.setMaximumHeight(_MIN_ROWS * _ROW_HEIGHT)
         self.list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         lay.addWidget(self.list)
 
@@ -246,16 +254,38 @@ class EdrpouList(QWidget):
     def _remove(self) -> None:
         for item in self.list.selectedItems():
             self.list.takeItem(self.list.row(item))
+        self._fit()
         self.changed.emit()
 
     def clear(self) -> None:
         self.list.clear()
+        self._fit()
         self.changed.emit()
 
     def _add_item(self, code: str) -> None:
         name = self.labels.get(code)
         item = QListWidgetItem(f"{code} — {name}" if name else code, self.list)
         item.setData(Qt.ItemDataRole.UserRole, code)
+        self._fit()
+
+    def showEvent(self, event) -> None:
+        # Перший показ — єдиний момент, коли висота рядка вже враховує таблицю
+        # стилів: у конструкторі її ще немає, і список виходив удвічі нижчим,
+        # ніж потрібно.
+        super().showEvent(event)
+        self._fit()
+
+    def _fit(self) -> None:
+        """Висота списку — під його вміст.
+
+        Фіксована висота або лишає пусте місце під двома кодами, або ховає
+        четвертий рядок під прокруткою; і те, й інше дратує саме тоді, коли
+        на список дивляться.
+        """
+        measured = self.list.sizeHintForRow(0) if self.list.count() else 0
+        row = max(measured, _ROW_HEIGHT)
+        rows = min(max(self.list.count(), _MIN_ROWS), _MAX_ROWS)
+        self.list.setMaximumHeight(rows * row + 2 * self.list.frameWidth() + 4)
 
     def values(self) -> list[str]:
         items = (self.list.item(i) for i in range(self.list.count()))
@@ -265,6 +295,7 @@ class EdrpouList(QWidget):
         self.list.clear()
         for code in codes or []:
             self._add_item(str(code))
+        self._fit()
         self.changed.emit()
 
 
