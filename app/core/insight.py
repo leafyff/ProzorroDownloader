@@ -817,6 +817,8 @@ class Analyzer(PlayersMixin, BenchmarkMixin, OutlookMixin, RejectionMixin):
             "Ціна за одиницю проти кількості", "scatter",
             [Series("Позиції", points=points, accent=accent)],
             unit="", money_axis=False,
+            x_title="Кількість, порядок величини",
+            y_title="Ціна за одиницю, порядок величини",
             hint=f"Обидві осі логарифмічні (порядок величини). Червоним — позиції, "
                  f"які алгоритм вважає викидами. Показано {len(points)} з "
                  f"{len(usable)} позицій із ціною.")

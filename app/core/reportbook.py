@@ -28,9 +28,17 @@ from openpyxl.chart import (
     AreaChart, BarChart, LineChart, PieChart, Reference, ScatterChart,
 )
 from openpyxl.chart import Series as XLSeries
+from openpyxl.chart.axis import ChartLines
 from openpyxl.chart.label import DataLabelList
 from openpyxl.chart.marker import DataPoint, Marker
 from openpyxl.chart.shapes import GraphicalProperties
+from openpyxl.chart.text import RichText, Text
+from openpyxl.chart.title import Title
+from openpyxl.drawing.line import LineProperties
+from openpyxl.drawing.text import (
+    CharacterProperties, Paragraph, ParagraphProperties, RegularTextRun,
+    RichTextProperties,
+)
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter, quote_sheetname
 from openpyxl.worksheet.filters import AutoFilter
@@ -52,6 +60,7 @@ BLOCK_FONT = Font(size=13, bold=True, color="1F3864")
 GROUP_FONT = Font(size=11, bold=True, color="44546A")
 NAME_FONT = Font(size=11, bold=True)
 HINT_FONT = Font(size=9, italic=True, color="707070")
+LINK_FONT = Font(color="0563C1", underline="single")
 TILE_FILL = PatternFill("solid", fgColor="EEF2FA")
 TABLE_STYLE = TableStyleInfo(name="TableStyleLight8", showRowStripes=True,
                              showColumnStripes=False)
@@ -88,6 +97,37 @@ SCATTER_CAP = 1000
 #: Символи, які Excel не пускає в назву аркуша.
 _BAD_SHEET = re.compile(r"[\[\]:*?/\\]")
 
+#: Сторінка закупівлі на порталі. Портал відкриває її просто за людським
+#: номером — тим самим, що стоїть у таблиці, — тож ані UUID, ані зайвого
+#: запиту для посилання не потрібно.
+TENDER_URL = "https://prozorro.gov.ua/tender/{}"
+#: Людський номер закупівлі: ``UA-2026-08-21-000123-a``. Шаблон навмисно
+#: прив'язаний до країв рядка: у «Ключі» зауважень поруч лежать і описи
+#: позицій, і кілька номерів через кому — таке посилання назвати не може.
+#: Перевірено на всіх 3 966 977 номерах індексу ЦБД: інших форм немає.
+TENDER_ID = re.compile(r"^UA-\d{4}-\d{2}-\d{2}-\d{6}-[a-z]$")
+
+# --- вигляд діаграм -------------------------------------------------------
+# Excel малює діаграму без жодних вказівок так, як 2007-го: чорна рамка,
+# чорна сітка, чорний текст. Числа від цього не змінюються, а от читати
+# книгу стає важко, тож кольори тексту й ліній задані тут явно.
+
+#: Колір назви діаграми — той самий, що й у заголовків аркуша.
+CHART_TITLE_COLOR = "1F3864"
+#: Колір підписів осей, легенди й підписів значень.
+CHART_TEXT_COLOR = "404040"
+#: Лінії сітки: помітні, але тихіші за самі дані.
+CHART_GRID_COLOR = "D9D9D9"
+#: Лінії осей — на півтону темніші за сітку.
+CHART_AXIS_COLOR = "BFBFBF"
+#: Розмір шрифту в сотих пункта, як велить OOXML: 1200 — це 12 пт.
+TITLE_SIZE = 1200
+LABEL_SIZE = 900
+#: Найбільша кількість смуг, за якої підписи значень ще не зливаються.
+#: Виміряно на 20-сантиметровій діаграмі: 16 рядків читаються, далі підпис
+#: сідає на сусідній.
+LABEL_ROWS = 16
+
 
 def _rgb(color: str) -> str:
     """``#3d7eff`` в ``3D7EFF``: OOXML не знає ані решітки, ані малих літер."""
@@ -115,13 +155,20 @@ def _trim(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()[:31].strip(" ,.;:-—'`")
 
 
-def _column_formats(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> list[str | None]:
-    """Формати колонок таблиці — за назвою, як і в таблиці на екрані.
+def _column_specs(headers: Sequence[str],
+                  rows: Sequence[Sequence[Any]]) -> tuple[list[str | None], list[bool]]:
+    """Формат кожної колонки й ознака «тут номери закупівель».
 
-    Частка («Частка», «Дисконт», «Розрив»…) — відсоток; решта чисел — розряди,
-    а копійки лише там, де вони справді є: у сумі договору на 90 000 два нулі
-    після коми — просто шум, а в ціні за одиницю округлення до гривні
-    спотворює порівняння.
+    Формат — за назвою, як і в таблиці на екрані. Частка («Частка»,
+    «Дисконт», «Розрив»…) — відсоток; решта чисел — розряди, а копійки лише
+    там, де вони справді є: у сумі договору на 90 000 два нулі після коми —
+    просто шум, а в ціні за одиницю округлення до гривні спотворює
+    порівняння.
+
+    Колонка з номерами впізнається за самими значеннями, а не за назвою:
+    номер лежить і в «Закупівлі», і в «Ключі» зауважень, а поруч у тому ж
+    «Ключі» — описи позицій. За назвою вийшло б або пропустити половину,
+    або пообіцяти посилання там, де його нема з чого зробити.
 
     Один прохід по таблиці, а не по проходу на колонку: у «Зауваженнях до
     даних» п'ять тисяч рядків і одинадцять колонок, і поколонковий обхід
@@ -130,12 +177,17 @@ def _column_formats(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> li
     width = len(headers)
     numeric = [False] * width
     whole = [True] * width
+    links = [False] * width
     for row in rows:
         for i, value in zip(range(width), row):
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 numeric[i] = True
                 if whole[i] and not float(value).is_integer():
                     whole[i] = False
+            # Дешева прикмета перед шаблоном: у книзі сотні тисяч клітинок,
+            # і майже жодна з них не починається з «UA-».
+            elif not links[i] and isinstance(value, str) and value[:3] == "UA-":
+                links[i] = TENDER_ID.match(value) is not None
     out: list[str | None] = []
     for i, header in enumerate(headers):
         if not numeric[i]:
@@ -144,7 +196,7 @@ def _column_formats(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> li
             out.append("0.0%")
         else:
             out.append("#,##0" if whole[i] else "#,##0.00")
-    return out
+    return out, links
 
 
 def _chart_format(chart: ChartData) -> str:
@@ -192,8 +244,8 @@ def chart_table(chart: ChartData) -> Sheet:
                  None if i in accent else points[i][1],
                  points[i][1] if i in accent else None]
                 for i in chosen]
-        name = series.name if series and series.name else "Значення"
-        return ["X", name, "Викиди"], rows
+        name = chart.y_title or (series.name if series and series.name else "Значення")
+        return [chart.x_title or "X", name, "Викиди"], rows
 
     with_labels = [s for s in chart.series if s.labels]
     if not with_labels:
@@ -378,21 +430,29 @@ class _Page:
         На великій вибірці це під пів мільйона клітинок, тож замість
         ``_put`` з іменованими параметрами йде прямий цикл, а ширину колонки
         міряють лише перші рядки: далі вона все одно впирається в межу.
+
+        Номер закупівлі стає посиланням на її сторінку на порталі. Посилання
+        справжнє, а не формулою ``HYPERLINK``: тоді в клітинці лишається сам
+        номер, і відбір, сортування та зведені таблиці бачать текст, а не
+        результат обчислення.
         """
         ws = self.ws
         width = len(names)
-        formats = _column_formats(names, rows)
-        columns = list(zip(range(1, width + 1), formats))
+        formats, links = _column_specs(names, rows)
+        columns = list(zip(range(1, width + 1), formats, links))
         for offset, row in enumerate(rows, start=1):
             line = head + offset
             measure = offset <= WIDTH_ROWS
-            for (col, fmt), value in zip(columns, row):
+            for (col, fmt, link), value in zip(columns, row):
                 cell = ws.cell(row=line, column=col)
                 cell.value = value
                 if cell.data_type in ("f", "e"):
                     cell.data_type = "s"
                 if fmt is not None:
                     cell.number_format = fmt
+                elif link and isinstance(value, str) and TENDER_ID.match(value):
+                    cell.hyperlink = TENDER_URL.format(value)
+                    cell.font = LINK_FONT
                 if measure and value is not None:
                     size = min(MAX_WIDTH, len(str(value)))
                     if size > self.widths.get(col, 0):
@@ -446,8 +506,10 @@ def _excel_chart(chart: ChartData, ws: Worksheet, head: int, n_rows: int,
 
     if chart.kind == "scatter":
         drawn = ScatterChart()
-        drawn.x_axis.title = "X"
-        drawn.y_axis.title = "Y"
+        drawn.x_axis.title = _chart_title(chart.x_title or "X", LABEL_SIZE,
+                                          CHART_TEXT_COLOR)
+        drawn.y_axis.title = _chart_title(chart.y_title or "Y", LABEL_SIZE,
+                                          CHART_TEXT_COLOR)
         for i in range(n_series):
             values = Reference(ws, min_col=2 + i, min_row=head, max_row=last)
             item = XLSeries(values, cats, title_from_data=True)
@@ -462,8 +524,15 @@ def _excel_chart(chart: ChartData, ws: Worksheet, head: int, n_rows: int,
         drawn.add_data(Reference(ws, min_col=2, min_row=head, max_row=last),
                        titles_from_data=True)
         drawn.set_categories(cats)
-        drawn.dataLabels = DataLabelList()
-        drawn.dataLabels.showPercent = True
+        # Кожне «показувати» доводиться вимикати поіменно. Сказавши лише
+        # ``showPercent``, решту Excel бере на власний розсуд і виводить усе,
+        # що знає: «Сума, грн; Машини для обробки даних (апаратна частина);
+        # 76 901 586; 65%» — чотири рядки на кожен сектор, які накривали
+        # і сусідні підписи, і назву діаграми.
+        drawn.dataLabels = DataLabelList(
+            showPercent=True, showVal=False, showCatName=False, showSerName=False,
+            showLegendKey=False, showBubbleSize=False, showLeaderLines=True,
+            dLblPos="bestFit", txPr=_label_text())
         if drawn.series:
             drawn.series[0].data_points = [
                 _point(i, SERIES_COLORS[i % len(SERIES_COLORS)]) for i in range(n_rows)]
@@ -476,7 +545,11 @@ def _excel_chart(chart: ChartData, ws: Worksheet, head: int, n_rows: int,
             drawn = BarChart()
             drawn.type = "bar" if chart.kind == "hbar" else "col"
             drawn.grouping = "clustered"
-            drawn.gapWidth = 60
+            # Проміжок міряється у відсотках ширини смуги, тож на двох
+            # категоріях звичні 60% дають смугу завтовшки з третину діаграми:
+            # вона читається як заливка, а не як стовпчик. Висоту при цьому
+            # чіпати не можна — під нею стоїть розкладка аркуша.
+            drawn.gapWidth = 60 if n_rows > 4 else 150
         drawn.add_data(Reference(ws, min_col=2, max_col=1 + n_series,
                                  min_row=head, max_row=last), titles_from_data=True)
         drawn.set_categories(cats)
@@ -497,15 +570,20 @@ def _excel_chart(chart: ChartData, ws: Worksheet, head: int, n_rows: int,
             if marks and chart.kind in ("bar", "hbar", "hist"):
                 item.data_points = [_point(idx, OWN_COLOR) for idx in sorted(marks)]
 
-    drawn.title = chart.title
+    drawn.title = _chart_title(chart.title)
     drawn.width = CHART_WIDTH
     drawn.height = _chart_height(chart, n_rows)
-    drawn.style = 2
+    # Рамки навколо діаграми немає: аркуш і так без сітки, а чорний
+    # прямокутник лише додавав ліній до й без того щільної сторінки.
+    drawn.graphical_properties = GraphicalProperties(
+        solidFill="FFFFFF", ln=LineProperties(noFill=True))
     if chart.kind != "pie":
         # openpyxl лишає осі «видаленими», якщо їх не чіпати, — на аркуші
         # виходила діаграма без жодного підпису.
         drawn.x_axis.delete = False
         drawn.y_axis.delete = False
+        _dress_axis(drawn.x_axis)
+        _dress_axis(drawn.y_axis, grid=True)
     if chart.kind not in ("pie", "scatter"):
         # У openpyxl вісь X — завжди категорії, а вісь Y — завжди значення;
         # смугова діаграма лише малює їх боком. Перевірено на живому Excel:
@@ -513,18 +591,76 @@ def _excel_chart(chart: ChartData, ws: Worksheet, head: int, n_rows: int,
         drawn.y_axis.numFmt = fmt
         if chart.kind == "hbar":
             # Excel кладе першу категорію донизу, а в нас перший рядок —
-            # найбільший, і він має бути згори. Сам лише розворот переносить
-            # вісь значень угору, тож до нього потрібен «перетин на
-            # максимальній категорії», який лишає її внизу.
+            # найбільший, і він має бути згори. Розворот категорій піднімає
+            # разом із ними й вісь значень, тож її саму просять перетнути
+            # категорії на останній — тобто лишитися внизу.
+            #
+            # «Перетин на максимумі» має стояти саме на осі значень.
+            # Покладений на вісь категорій, він **знебарвлює всю діаграму**:
+            # виміряно 02.09.2026 на живому Excel — смуги виходять білі з
+            # чорним обведенням, хоча кольори в книзі є (об'єктна модель
+            # Excel віддає ту саму заливку 16743997), а ще така діаграма не
+            # вивантажується в картинку. Смугових діаграм у звіті більшість
+            # (91 зі 181), тож у чорно-білу перетворювалася майже вся книга.
             drawn.x_axis.scaling.orientation = "maxMin"
-            drawn.x_axis.crosses = "max"
+            drawn.y_axis.crosses = "max"
+    if chart.kind in ("bar", "hbar", "hist") and n_series == 1 and n_rows <= LABEL_ROWS:
+        # Підпис значення просто на смузі: інакше висоту стовпчика доводиться
+        # міряти оком по сітці, а числа й так лежать у таблиці поруч.
+        drawn.dataLabels = DataLabelList(
+            showVal=True, showCatName=False, showSerName=False, showPercent=False,
+            showLegendKey=False, showBubbleSize=False, numFmt=fmt,
+            dLblPos="outEnd", txPr=_label_text())
     named = [s for s in chart.series if s.name]
     if len(named) < 2 and chart.kind != "pie":
         drawn.legend = None
     elif drawn.legend is not None:
         drawn.legend.position = "b"
         drawn.legend.overlay = False
+        drawn.legend.txPr = _label_text()
     return drawn
+
+
+def _chart_title(text: str, size: int = TITLE_SIZE,
+                 color: str = CHART_TITLE_COLOR) -> Title:
+    """Назва діаграми — над малюнком, а не поверх нього.
+
+    ``overlay`` Excel вважає увімкненим, доки в книзі не сказано протилежне,
+    тож назва лягала просто на верхню лінію сітки, а на смуговій — ще й на
+    підписи осі значень. Саме це й читалося як «текст поверх тексту».
+
+    Так само підписані й осі точкової хмари — там без назви осі видно лише
+    два стовпці голих чисел.
+    """
+    props = CharacterProperties(sz=size, b=True, solidFill=color)
+    para = Paragraph(pPr=ParagraphProperties(defRPr=props),
+                     r=[RegularTextRun(t=str(text or ""))])
+    return Title(tx=Text(rich=RichText(p=[para])), overlay=False)
+
+
+def _label_text() -> RichText:
+    """Спільний вигляд дрібного тексту діаграми: осі, легенда, підписи."""
+    props = CharacterProperties(sz=LABEL_SIZE, solidFill=CHART_TEXT_COLOR)
+    body = RichTextProperties(vert="horz")
+    # ``r=[]`` навмисно: тут описано, **як** виглядає текст, а не який він.
+    # Без цього openpyxl кладе всередину порожній рядок тексту, і в книзі
+    # з'являється ``<a:r><a:t/></a:r>`` — ні на що не схожий, зате видний.
+    return RichText(bodyPr=body,
+                    p=[Paragraph(pPr=ParagraphProperties(defRPr=props),
+                                 endParaRPr=props, r=[])])
+
+
+def _dress_axis(axis, *, grid: bool = False) -> None:
+    """Вісь у кольорах звіту: тиха лінія, сіра сітка, читабельний підпис."""
+    axis.txPr = _label_text()
+    axis.spPr = GraphicalProperties(ln=LineProperties(solidFill=CHART_AXIS_COLOR))
+    axis.majorTickMark = "out"
+    axis.minorTickMark = "none"
+    if grid:
+        axis.majorGridlines = ChartLines(
+            spPr=GraphicalProperties(ln=LineProperties(solidFill=CHART_GRID_COLOR)))
+    else:
+        axis.majorGridlines = None
 
 
 def _point(index: int, color: str) -> DataPoint:

@@ -2441,7 +2441,8 @@ def _demo_report():
         ChartData("Ціна проти кількості", "scatter",
                   [Series("Позиції",
                           points=[(float(i), float(i % 7)) for i in range(3000)],
-                          accent={1, 2})], money_axis=False),
+                          accent={1, 2})], money_axis=False,
+                  x_title="Кількість, шт", y_title="Ціна за одиницю, грн"),
         ChartData("Порожній", "bar", [Series("Нічого", [], [])]),
     ]
     block.tables = [
@@ -2467,7 +2468,13 @@ def _demo_report():
     profile.block.charts.append(
         ChartData("Ключові замовники", "hbar",
                   [Series("Сума", ["Лікарня"], [10.0])], unit="грн"))
-    profile.block.tables.append(("Угоди", (["Закупівля", "Сума, грн"], [["UA-1", 10.0]])))
+    # Два рядки навмисно різні: перший — номер закупівлі, який має стати
+    # посиланням, другий — кілька номерів в одній клітинці (так пише «Ключ»
+    # зауважень), і посилання з нього зробити нема з чого.
+    profile.block.tables.append(
+        ("Угоди", (["Закупівля", "Сума, грн"],
+                   [["UA-2026-08-21-000123-a", 10.0],
+                    ["UA-2026-08-21-000123-a, UA-2026-08-21-000124-b", 5.0]])))
     report.ours = [profile]
     return report
 
@@ -2623,6 +2630,95 @@ def test_report_book(tmp: Path) -> None:
     check("зміст веде на аркуші",
           any(str(wb["Зміст"].cell(row=r, column=3).value or "").startswith("=HYPERLINK")
               for r in range(1, wb["Зміст"].max_row + 1)))
+    wb.close()
+
+
+def test_report_tender_links(tmp: Path) -> None:
+    print("\n=== номер закупівлі в книзі веде на портал ===")
+    from openpyxl import load_workbook
+
+    from app.core.reportbook import TENDER_URL, write_report
+
+    number = "UA-2026-08-21-000123-a"
+    path = write_report(tmp / "посилання.xlsx", _demo_report())
+    wb = load_workbook(path)
+    ws = wb["Ми1 ТОВ А"]
+    cells = [ws.cell(row=r, column=1) for r in range(1, ws.max_row + 1)]
+    one = next(c for c in cells if c.value == number)
+    many = next(c for c in cells if str(c.value or "").count("UA-") > 1)
+
+    check("номер веде на сторінку закупівлі",
+          one.hyperlink is not None and one.hyperlink.target == TENDER_URL.format(number),
+          one.hyperlink.target if one.hyperlink else None)
+    check("у клітинці лишився сам номер, а не формула", one.value == number, one.value)
+    check("посилання видно оком", one.font.underline == "single", one.font.underline)
+    # Кілька номерів через кому — це «Ключ» зауважень: посилання з такого
+    # рядка зробити нема з чого, і вигадувати перший номер не можна.
+    check("кілька номерів в одній клітинці посиланням не стають",
+          many.hyperlink is None, many.value)
+    # Сума в тій самій таблиці лишається числом: посилання чіпляється лише
+    # до текстової колонки з номерами.
+    money = ws.cell(row=one.row, column=2)
+    check("сусідня сума лишилася числом",
+          money.hyperlink is None and money.value == 10.0, money.value)
+    wb.close()
+
+
+def test_report_chart_look(tmp: Path) -> None:
+    print("\n=== вигляд діаграм у книзі ===")
+    from openpyxl import load_workbook
+
+    from app.core.reportbook import write_report
+
+    path = write_report(tmp / "діаграми.xlsx", _demo_report())
+    wb = load_workbook(path)
+    market = wb["Ринок"]
+
+    def title_of(chart) -> str:
+        rich = chart.title.tx.rich
+        return "".join(run.t or "" for para in rich.p for run in (para.r or []))
+
+    charts = {title_of(chart): chart for chart in market._charts}
+    check("назви діаграм читаються з книги",
+          "Топ постачальників" in charts, sorted(charts))
+
+    check("назва стоїть над діаграмою, а не поверх неї",
+          all(chart.title.overlay is False for chart in market._charts),
+          [(t, c.title.overlay) for t, c in charts.items()])
+
+    bars = charts["Топ постачальників"]
+    # Це не косметика: «перетин на максимумі», покладений на вісь категорій,
+    # знебарвлює всю діаграму — смуги виходять білі з чорним обведенням.
+    check("розворот смугової — на осі категорій",
+          bars.x_axis.scaling.orientation == "maxMin", bars.x_axis.scaling.orientation)
+    check("перетин на максимумі — на осі значень, інакше смуги білі",
+          bars.y_axis.crosses == "max" and bars.x_axis.crosses is None,
+          (bars.x_axis.crosses, bars.y_axis.crosses))
+    check("смуга підписана своїм числом",
+          bars.dataLabels is not None and bars.dataLabels.showVal is True,
+          bars.dataLabels)
+
+    line = charts["Динаміка"]
+    check("лінія з двома рядами підписів значень не отримує",
+          line.dataLabels is None, line.dataLabels)
+
+    pie = charts["Процедури"]
+    labels = pie.dataLabels
+    check("сектор підписаний лише відсотком",
+          labels.showPercent is True and not labels.showVal
+          and not labels.showCatName and not labels.showSerName,
+          (labels.showPercent, labels.showVal, labels.showCatName, labels.showSerName))
+
+    scatter = charts["Ціна проти кількості"]
+    check("осі хмари названі по-людськи",
+          "кількість" in str(scatter.x_axis.title.tx.rich.p[0].r[0].t).lower(),
+          scatter.x_axis.title.tx.rich.p[0].r[0].t)
+
+    grid = bars.y_axis.majorGridlines.spPr.ln.solidFill
+    check("сітка не чорна", getattr(grid, "srgbClr", grid) == "D9D9D9", grid)
+    check("рамки навколо діаграми немає",
+          bars.graphical_properties.ln.noFill is True,
+          bars.graphical_properties.ln.noFill)
     wb.close()
 
 
@@ -4289,6 +4385,8 @@ def main() -> int:
         test_export_names(tmp)
         test_report_overview(tmp)
         test_report_book(tmp)
+        test_report_tender_links(tmp)
+        test_report_chart_look(tmp)
         test_profile_book(tmp)
         test_profile_export_button(tmp)
         test_number_formats()
