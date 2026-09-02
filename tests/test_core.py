@@ -283,6 +283,201 @@ def test_market_api() -> None:
     check("рядок придатний для SQLite", not bad, bad)
 
 
+def test_product_groups() -> None:
+    """Той самий товар під різними назвами має бути одним рядком.
+
+    Пастки тут не вигадані: усі приклади взяті з живого вивантаження, а порядок
+    і поле ``beats`` у ``data/product_types.json`` підібрані саме під них.
+    """
+    print("\n=== об'єднання назв товарів ===")
+    from app.core.products import by_catalog, catalog, head_noun, normalize, product_group
+
+    check("довідник завантажився", len(catalog()) > 40, len(catalog()))
+
+    # 1. Те, з чого все почалося: одна річ під п'ятьма назвами.
+    mouse = ["Миші", "Мишка", "Миша", "Миша безпровідна Gembird", "Комп’ютерна миша",
+             "Мишка комп'ютерна", "маніпулятор миша"]
+    groups = {product_group(t) for t in mouse}
+    check("миша в усіх написаннях — один товар", groups == {"Миша"}, groups)
+
+    # 2. Апостроф буває чотирьох накреслень, і це різні символи.
+    pc = {product_group(t) for t in ("Комп'ютер", "Комп’ютер", "Компʼютер",
+                                     "Персональні комп'ютери", "ПК")}
+    check("апостроф не розриває товар на кілька", pc == {"Персональний комп'ютер"}, pc)
+
+    # 3. Число й відмінок.
+    check("однина і множина разом",
+          product_group("Монітори") == product_group("Монітор") == "Монітор")
+    check("абревіатура і повна назва разом",
+          product_group("БФП лазерний") == product_group("Багатофункціональні пристрої")
+          == "Багатофункціональний пристрій (БФП)")
+
+    # 4. Уточнення після товару не робить його іншим товаром, але й не краде
+    #    аксесуар: українською головне слово стоїть першим.
+    pairs = [
+        ("Килимок для мишки Gembird", "Килимок для миші"),
+        ("Кабель монітора 1.8м VGA", "Кабель, перехідник"),
+        ("Кулер для процесора Deepcool", "Кулер, вентилятор, термопаста"),
+        ("Клавіатура для ноутбука ASUS", "Клавіатура"),
+        ("Сумка для ноутбука CASE LOGIC", "Сумка або чохол"),
+        ("Блок живлення ноутбука", "Блок живлення"),
+    ]
+    wrong = [(text, product_group(text)) for text, want in pairs
+             if product_group(text) != want]
+    check("уточнення не перетягує товар до себе", not wrong, wrong)
+
+    # 5. Виняток `beats`: опис починається із загального слова, а товар вужчий.
+    check("SSD не тоне в загальному «накопичувачі»",
+          product_group("Накопичувач SSD USB Type-C 2TB Kingston") == "Накопичувач SSD")
+    check("сканер штрих-коду не зливається зі сканером",
+          product_group("Сканер штрих-коду Symbol LS2208") == "Сканер штрих-коду")
+    check("«принтер БФП» — це БФП",
+          product_group("принтер БФП HP Smart Tank") == "Багатофункціональний пристрій (БФП)")
+
+    # 6. Код ДК021 і назва класу — це заголовок, а не товар.
+    check("товар беруть із дужок після коду класу",
+          product_group("30230000-0 Комп’ютерне обладнання (монітор)") == "Монітор",
+          product_group("30230000-0 Комп’ютерне обладнання (монітор)"))
+    check("сам лише код класу товару не називає",
+          normalize("30230000-0 Комп’ютерне обладнання") == "",
+          normalize("30230000-0 Комп’ютерне обладнання"))
+
+    # 7. Друкарські помилки й латиниця замість кирилиці.
+    check("латинська H у «Haкопичувач»",
+          product_group("Haкопичувач SSD M.2 2280") == "Накопичувач SSD")
+    check("описка в назві", product_group("Монтітор") == "Монітор")
+
+    # 8. Різні речі не мають злипатися.
+    check("системний блок — це не блок живлення",
+          product_group("Системний блок НЕО") != product_group("Блок живлення"),
+          (product_group("Системний блок НЕО"), product_group("Блок живлення")))
+    check("ноутбук — це не сумка для ноутбука",
+          product_group("Ноутбук ASUS") != product_group("Сумка для ноутбука"))
+
+    # 9. Запасне правило для того, чого немає в довіднику.
+    check("незнайоме слово зводиться до основи",
+          head_noun("Зрощувачі оптичні") == head_noun("Зрощувач"),
+          (head_noun("Зрощувачі оптичні"), head_noun("Зрощувач")))
+    check("прикметник не стає товаром", head_noun("Твердотільний накопичувач") == "накопичувач",
+          head_noun("Твердотільний накопичувач"))
+    check("порожній опис — порожня група", product_group("   ") == "")
+    check("довідник мовчить про сторонній товар", by_catalog("Бетонозмішувач") == "")
+
+
+def test_two_product_tables(tmp: Path) -> None:
+    """У звіті дві таблиці товарів: об'єднана й «як у документах»."""
+    print("\n=== дві таблиці товарів ===")
+    from app.core import insight
+    from app.core.xlsxload import Dataset
+
+    def item(tender: str, text: str, qty: float = 1.0):
+        return {"tender_id": tender, "lot_id": "", "description": text, "cpv": "30213300-8",
+                "cpv_name": "", "quantity": qty, "unit": "шт", "unit_price": 100.0,
+                "buyer": "Замовник", "buyer_edrpou": "04527520", "date": "2026-03-01"}
+
+    tenders = [{"tender_id": f"UA-{i}", "date": "2026-03-01", "title": "Мишки",
+                "description": "", "cpv_list": "30213300-8", "status": "Завершена",
+                "method": "Відкриті торги", "category": "goods", "value": 1000.0,
+                "currency": "UAH", "vat": "так", "buyer": "Замовник",
+                "buyer_edrpou": "04527520", "region": "Київська область", "locality": "Київ",
+                "n_lots": 0, "n_bids": 1, "n_docs": 0, "tender_start": "", "tender_end": "",
+                "modified": "", "url": ""} for i in range(4)]
+    items = [item("UA-0", "Миші"), item("UA-1", "Мишка"), item("UA-2", "Миша дротова"),
+             item("UA-3", "Монітори")]
+    data = Dataset(path=tmp / "товари.xlsx", tenders=tenders, items=items)
+    report = insight.analyse(data)
+
+    tables = dict(report.sections["Товари і ТМ"][0].tables)
+    check("є обидві таблиці",
+          "Товари ринку (об'єднані)" in tables
+          and "Товари ринку (як у документах)" in tables, list(tables))
+    grouped, raw = tables["Товари ринку (об'єднані)"], tables["Товари ринку (як у документах)"]
+    check("об'єднана коротша", len(grouped[1]) == 2 and len(raw[1]) == 4,
+          (len(grouped[1]), len(raw[1])))
+    check("миші зведені в один рядок",
+          any(r[0] == "Миша" and r[1] == 3 for r in grouped[1]), grouped[1])
+    check("видно, що саме злилося",
+          "Варіанти назви" in grouped[0]
+          and any("Мишка" in str(r[-1]) for r in grouped[1]), grouped[1])
+    # Головний інваріант: об'єднання не має нічого губити дорогою.
+    check("сума позицій однакова в обох таблицях",
+          sum(r[1] for r in grouped[1]) == sum(r[1] for r in raw[1]) == 4,
+          (sum(r[1] for r in grouped[1]), sum(r[1] for r in raw[1])))
+    check("кількість товару теж збігається",
+          sum(r[3] for r in grouped[1]) == sum(r[3] for r in raw[1]))
+    check("у примітці сказано про об'єднання",
+          any("формулювань" in n for n in report.sections["Товари і ТМ"][0].notes),
+          report.sections["Товари і ТМ"][0].notes)
+
+
+def test_gone_cards(tmp: Path) -> None:
+    """Картки, яких каталог більше не віддає, не мають заливати журнал.
+
+    Каталог відповідає ``404 Category not found`` на товар, чия категорія
+    вилучена з довідника, — це стан його даних, а не збій. Таких карток бувають
+    сотні, тож поштучно вони не потрібні: потрібен підсумок. А от справжні збої
+    навпаки — мають лишитися видимими.
+    """
+    import requests
+
+    from app.core.pipeline import MARKET_WARN_LIMIT, _card_gone
+
+    print("\n=== картки, яких каталог більше не віддає ===")
+
+    def http_error(code: int) -> requests.HTTPError:
+        response = requests.Response()
+        response.status_code = code
+        return requests.HTTPError(f"HTTP {code}", response=response)
+
+    check("404 — картки немає", _card_gone(http_error(404)))
+    check("503 — це збій, а не відсутність", not _card_gone(http_error(503)))
+    check("помилка без відповіді — теж збій", not _card_gone(ValueError("розрив зв'язку")))
+
+    logs: list[tuple[str, str]] = []
+    preset = SearchPreset(cpv_codes=["30213300-8"], cpv_prefixes=[],
+                          date_from="2026-01-01", date_to="2026-12-31")
+    pipe = Pipeline(Settings(), preset, Database(tmp / "gone.db"),
+                    on_log=lambda level, msg: logs.append((level, msg)))
+
+    class FakeMarket:
+        """Каталог, у якому половина карток застаріла, а одна просто впала."""
+
+        def search(self, *, cpv=None, text="", max_pages=500):
+            rows = [{"id": f"{i:04d}", "status": "active",
+                     "title": f"Товар {i}", "dateModified": "2026-08-01T00:00:00+03:00"}
+                    for i in range(12)]
+            yield 1, len(rows), rows
+
+        def product(self, pid: str):
+            if pid == "0000":
+                raise http_error(500)
+            if int(pid) % 2:
+                raise http_error(404)
+            return {"id": pid, "status": "active", "title": f"Товар {pid}"}
+
+        @staticmethod
+        def category_title(_cid: str) -> str:
+            return ""
+
+    pipe.market = FakeMarket()
+    saved = pipe.collect_products()
+
+    check("справні картки збережені", saved == 5, saved)
+    per_card = [m for level, m in logs if m.startswith("Картка ")]
+    check("застарілі картки поштучно не перелічуються", len(per_card) <= MARKET_WARN_LIMIT,
+          per_card)
+    check("справжній збій лишився видимим",
+          any("HTTP 500" in m for m in per_card), per_card)
+    summary = [m for _l, m in logs if "не віддав" in m]
+    check("є підсумок про застарілі картки", summary and "6 карток" in summary[0], summary)
+    check("підсумок пояснює причину",
+          summary and "категорію" in summary[0] and "не наша помилка" in summary[0],
+          summary)
+    check("інші збої теж полічені",
+          any("з інших причин" in m for _l, m in logs), [m for _l, m in logs][-3:])
+    pipe.client.close()
+
+
 def test_search_quota() -> None:
     """Портал дає рівно 60 запитів на вікно в 60 с — маємо в них вкладатися."""
     import threading
@@ -367,6 +562,12 @@ def _plan_search(depths, page_size=20, per_day=40):
                 if value == "" or value == []:
                     raise AssertionError(
                         f"порожнє поле {key!r} у тілі запиту — сервер відповів би 422")
+            # І так само відхиляє задовгі значення процедури: «The proc_type.0
+            # may not be greater than 30 characters».
+            for value in body.get("proc_type") or []:
+                if len(value) > 30:
+                    raise AssertionError(
+                        f"proc_type {value!r} — {len(value)} символів, сервер відповів би 422")
             self.queries.append(dict(body))
             total = self._total(body)
             page = int(body.get("page") or 1)
@@ -460,6 +661,221 @@ def test_search_plan(tmp: Path) -> None:
     fake, _ = run({"*": SEARCH_MAX_RESULTS}, methods=["aboveThresholdUA"])
     check("один код і одна процедура не спричиняють нескінченний поділ",
           len(fake.walked) <= 8, len(fake.walked))
+
+
+def _buyer_search(total_records=15000, n_buyers=8, page_size=20, per_day=40):
+    """Фейк пошуку зі справжньою стелею й фільтром за замовником.
+
+    Уся видача — ``total_records`` записів від найновіших, по ``per_day`` на
+    добу; замовник у кожного свій за колом. Сервер, як і живий, показує не
+    більше 10 000 записів на запит і не дає сторінки за 500-ту — тож дістати
+    давніші можна лише вужчим запитом.
+    """
+    from app.core.api import SEARCH_MAX_PAGE, SEARCH_MAX_RESULTS
+    from datetime import date as _d, timedelta as _td
+
+    class FakeSearch:
+        def __init__(self):
+            self.queries = []
+
+        @staticmethod
+        def _matching(wanted) -> list[int]:
+            return [n for n in range(total_records)
+                    if not wanted or f"{n % n_buyers:08d}" in wanted]
+
+        @staticmethod
+        def _row(n: int) -> dict:
+            day = (_d(2026, 12, 31) - _td(days=n // per_day)).isoformat()
+            return {"tenderID": f"UA-{day}-{n:06d}",
+                    "procuringEntity": {"identifier": {"id": f"{n % n_buyers:08d}"}}}
+
+        def query(self, entity, body):
+            self.queries.append(dict(body))
+            page = int(body.get("page") or 1)
+            if page > SEARCH_MAX_PAGE:
+                raise AssertionError("сторінка за 500-ту — сервер відповів би 422")
+            rows = self._matching(set(body.get("buyer") or ()))
+            shown = min(len(rows), SEARCH_MAX_RESULTS)
+            window = rows[(page - 1) * page_size:page * page_size]
+            return {"total": shown, "data": [self._row(n) for n in window if n < len(rows)]}
+
+        def pages(self, entity="tenders", **kw):
+            self.queries.append(dict(kw))
+            rows = self._matching(set(kw.get("buyer") or ()))
+            shown = min(len(rows), SEARCH_MAX_RESULTS)
+            for page in range(1, SEARCH_MAX_PAGE + 1):
+                start = (page - 1) * page_size
+                if start >= shown:
+                    yield page, shown, []
+                    return
+                yield page, shown, [self._row(n) for n in rows[start:start + page_size]]
+                if page * page_size >= shown:
+                    return
+
+    return FakeSearch()
+
+
+def test_buyer_split(tmp: Path) -> None:
+    """Переповнений запит перегортається групами замовників.
+
+    Стеля стоїть не на кількості записів, а на адресації: сторінки за 500-ту
+    немає. Тому глибші записи бере лише вужчий запит — а замовник для цього
+    годиться, бо в кожної закупівлі він рівно один і список ЄДРПОУ сервер
+    об'єднує через АБО. Перелік замовників беремо з карток, які й так
+    перегорнуто, тож він не коштує жодного запиту.
+    """
+    print("\n=== розріз переповненого запиту за замовником ===")
+    logs: list[tuple[str, str]] = []
+    # Один код і одна процедура — розрізати вже нема чим, окрім замовника.
+    preset = SearchPreset(cpv_codes=["30213300-8"], cpv_prefixes=[],
+                          methods=["reporting"],
+                          date_from="2026-01-01", date_to="2026-12-31")
+    pipe = Pipeline(Settings(), preset, Database(tmp / "buyers.db"),
+                    on_log=lambda level, msg: logs.append((level, msg)))
+    pipe.search = _buyer_search()
+    cards = pipe.discover()
+
+    check("узято більше, ніж дозволяє стеля", len(cards) > 10_000, len(cards))
+    # Найдавніший запис лежить на позиції 14 999 — далеко за стелею.
+    deepest = min(pipe._published(row) for row in cards.values())
+    check("дісталися початку періоду", deepest <= "2026-01-02", deepest)
+    check("розріз ішов саме за замовником",
+          any(q.get("buyer") for q in pipe.search.queries),
+          [q.get("buyer") and len(q["buyer"]) for q in pipe.search.queries][:6])
+    check("сторінок за 500-ту не просили",
+          all(int(q.get("page") or 1) <= 500 for q in pipe.search.queries))
+    check("сказано, скільки додав розріз",
+          any("Розріз за замовником додав" in m for _l, m in logs),
+          [m for _l, m in logs if "замовник" in m][:1])
+    check("і що повноти це не гарантує",
+          any("повноти це не гарантує" in m for _l, m in logs),
+          [m for _l, m in logs if "гарантує" in m][:1])
+    check("зайвого попередження про стелю немає",
+          not any("упирається у стелю" in m for _l, m in logs),
+          [m for _l, m in logs if "стелю" in m][:1])
+    pipe.client.close()
+
+    # Коли замовників не видно (стара видача без procuringEntity), розрізати
+    # нема чим — і програма має чесно попередити, а не мовчати.
+    blind = Pipeline(Settings(), preset, Database(tmp / "blind.db"),
+                     on_log=lambda level, msg: logs.append((level, msg)))
+    blind.search = _plan_search({"*": 10_000})
+    logs.clear()
+    blind.discover()
+    check("без замовників у видачі — чесне попередження",
+          any("не видно достатньо різних ЄДРПОУ" in m for _l, m in logs)
+          and any("упирається у стелю" in m for _l, m in logs),
+          [m for _l, m in logs][-2:])
+    blind.client.close()
+
+
+def test_unnamed_procedure(tmp: Path) -> None:
+    """«Відбір за рамковою угодою» пошук назвати не може — беремо зі стрічки.
+
+    Значення ``proc_type`` довші за 30 символів сервер відхиляє
+    (`The proc_type.0 may not be greater than 30 characters`), а
+    ``closeFrameworkAgreementSelectionUA`` має 34. Такі закупівлі випадають
+    саме тоді, коли запит доводиться різати за процедурою, — і добираються з
+    індексу, куди тип процедури тепер потрапляє зі стрічки змін ЦБД.
+    """
+    from app.core.api import SEARCH_MAX_RESULTS
+
+    print("\n=== процедура, якої пошук не називає ===")
+    long_method = "closeFrameworkAgreementSelectionUA"
+    check("назва справді довша за межу", len(long_method) > 30, len(long_method))
+
+    codes = ["30213300-8", "30213100-6"]
+    logs: list[tuple[str, str]] = []
+    preset = SearchPreset(cpv_codes=list(codes), cpv_prefixes=[],
+                          date_from="2026-01-01", date_to="2026-12-31")
+    db = Database(tmp / "unnamed.db")
+    pipe = Pipeline(Settings(), preset, db, on_log=lambda level, msg: logs.append((level, msg)))
+    # Кожен запит упирається у стелю, тож поділ дійде до розрізу за процедурою.
+    pipe.search = _plan_search({"*": SEARCH_MAX_RESULTS})
+    pipe.discover()
+
+    check("довгу процедуру записано як пропущену",
+          pipe.unnamed_methods == {long_method}, pipe.unnamed_methods)
+    ceiling = [m for level, m in logs if "стелю пошуку" in m]
+    check("попередження про стелю каже, докуди дістає запит",
+          ceiling and "дістає лише до" in ceiling[0], ceiling[:1])
+    check("і не радить зсувати вікно в минуле",
+          ceiling and "зсунути вікно в минуле не вийде" in ceiling[0], ceiling[:1])
+
+    # Її ж можна позначити у фільтрі «Тип процедури» — і тоді вона потрапляла
+    # прямо в тіло запиту, а сервер відповідав 422 і валив увесь збір.
+    picked_preset = SearchPreset(cpv_codes=list(codes), cpv_prefixes=[],
+                                 methods=["aboveThresholdUA", long_method],
+                                 date_from="2026-01-01", date_to="2026-12-31")
+    chosen = Pipeline(Settings(), picked_preset, Database(tmp / "chosen.db"))
+    chosen.search = _plan_search({"*": 100})
+    chosen.discover()
+    check("обрану у фільтрі довгу процедуру в запит не кладемо",
+          all(all(len(v) <= 30 for v in (q.get("proc_type") or []))
+              for q in chosen.search.queries),
+          [q.get("proc_type") for q in chosen.search.queries][:2])
+    check("але й не забуваємо про неї", chosen.unnamed_methods == {long_method},
+          chosen.unnamed_methods)
+    chosen.client.close()
+
+    # Якщо в фільтрі лишити тільки її, шукати нема чого: пошук цю процедуру не
+    # знає, тож усі запити були б марними, а закупівлі однаково з індексу.
+    only = SearchPreset(cpv_codes=list(codes), cpv_prefixes=[], methods=[long_method],
+                        date_from="2026-01-01", date_to="2026-12-31")
+    solo = Pipeline(Settings(), only, Database(tmp / "solo.db"),
+                    on_log=lambda level, msg: logs.append((level, msg)))
+    solo.search = _plan_search({"*": 100})
+    logs.clear()
+    solo.discover()
+    check("із самою лише такою процедурою пошук не витрачає жодного запиту",
+          solo.search.queries == [], solo.search.queries[:2])
+    check("і про це сказано", any("тільки зі стрічки" in m for _l, m in logs),
+          [m for _l, m in logs][:2])
+    check("процедуру передано на добір", solo.unnamed_methods == {long_method},
+          solo.unnamed_methods)
+    solo.client.close()
+
+    # Індекс без типу процедури (зібраний давніше) — програма має сказати прямо.
+    db.index_put([("UA-2026-05-05-000001-a", "uuid-old", "", "2026-05-05", "", "", "", "", "")])
+    logs.clear()
+    check("зі старого індексу добирати нічого", pipe.pickup_unnamed({}) == {}, "")
+    check("і про це сказано прямо",
+          any("перебудуйте індекс" in m for _l, m in logs), [m for _l, m in logs][:1])
+
+    # Індекс зі стрічки: тип процедури є.
+    db.index_put([
+        ("UA-2026-03-11-000010-a", "uuid-a", "", "2026-03-11", "", long_method, "", "", ""),
+        ("UA-2026-07-22-000011-a", "uuid-b", "", "2026-07-22", "", long_method, "", "", ""),
+        ("UA-2026-08-01-000012-a", "uuid-c", "", "2026-08-01", "", "reporting", "", "", ""),
+        ("UA-2025-12-31-000013-a", "uuid-d", "", "2025-12-31", "", long_method, "", "", ""),
+        ("UA-2027-01-01-000014-a", "uuid-e", "", "2027-01-01", "", long_method, "", "", ""),
+    ])
+    logs.clear()
+    picked = pipe.pickup_unnamed({"UA-2026-03-11-000010-a": "uuid-a"})
+    check("узято лише потрібну процедуру за період",
+          picked == {"UA-2026-07-22-000011-a": "uuid-b"}, picked)
+    check("сказано, скільки знайдено й скільки з них нових",
+          any("добираю її зі стрічки" in m for _l, m in logs), [m for _l, m in logs][:1])
+    check("неповний індекс не замовчується",
+          any("тип процедури відомий лише для" in m for _l, m in logs),
+          [m for _l, m in logs][:1])
+
+    rows, with_method = db.index_method_coverage("2026-01-01", "2026-12-31")
+    check("покриття індексу рахується за датою з номера", (rows, with_method) == (4, 3),
+          (rows, with_method))
+
+    # З неповним індексом добирати нема звідки: у ньому лише знайдене пошуком.
+    settings = Settings()
+    settings.keep_full_index = False
+    lean = Pipeline(settings, preset, db, on_log=lambda level, msg: logs.append((level, msg)))
+    lean.unnamed_methods = {long_method}
+    logs.clear()
+    check("без повного індексу добір не вигадує даних", lean.pickup_unnamed({}) == {}, "")
+    check("і причину названо саме цю",
+          any("повний індекс" in m for _l, m in logs), [m for _l, m in logs][:1])
+    lean.client.close()
+    pipe.client.close()
+    db.close()
 
 
 def test_search_progress(tmp: Path) -> None:
@@ -595,6 +1011,59 @@ def test_output_dir(tmp: Path) -> None:
     s.output_dir = str(chosen)
     check("конвеєр і аналітика дивляться в одну теку",
           export_path("prozorro-дані", folder=s.output_dir).parent == Path(s.output_dir))
+
+
+def test_output_dir_inside_project(tmp: Path) -> None:
+    """Типово все має лягати в ``downloads`` проєкту — і на чужій машині теж."""
+    import json
+
+    from app.paths import (DOWNLOADS_DIRNAME, PROJECT_ROOT, default_output_dir,
+                           resolve_output_dir, store_output_dir)
+
+    print("\n=== усе своє — в теку проєкту ===")
+    check("типова тека — downloads у проєкті",
+          default_output_dir() == PROJECT_ROOT / DOWNLOADS_DIRNAME,
+          default_output_dir())
+    check("теку створено одразу", default_output_dir().is_dir())
+
+    for empty in ("", "   ", None):
+        check(f"порожнє значення ({empty!r}) → downloads",
+              resolve_output_dir(empty) == PROJECT_ROOT / DOWNLOADS_DIRNAME,
+              resolve_output_dir(empty))
+    check("відносний шлях відлічується від кореня проєкту, а не від cwd",
+          resolve_output_dir("downloads/архів") == PROJECT_ROOT / "downloads" / "архів",
+          resolve_output_dir("downloads/архів"))
+
+    # settings.json лежить у репозиторії: абсолютний шлях у ньому вів би збір
+    # на чужій машині в тéку з іншого профілю. Тому пишемо його відносним.
+    check("типова тека зберігається відносною",
+          store_output_dir(default_output_dir()) == DOWNLOADS_DIRNAME,
+          store_output_dir(default_output_dir()))
+    outside = tmp / "поза проєктом"
+    check("свідомо обрана тека поза проєктом лишається абсолютною",
+          store_output_dir(outside) == str(outside), store_output_dir(outside))
+
+    # Обіг через файл: збереження → читання не має виводити теку з проєкту.
+    s = Settings()
+    check("у пам'яті шлях абсолютний — його підставляють просто в Path",
+          Path(s.output_dir).is_absolute(), s.output_dir)
+    saved = tmp / "налаштування.json"
+    s.save(saved)
+    check("у файлі — відносний шлях",
+          json.loads(saved.read_text(encoding="utf-8"))["output_dir"] == DOWNLOADS_DIRNAME,
+          json.loads(saved.read_text(encoding="utf-8"))["output_dir"])
+    check("після читання — знову тека проєкту",
+          Path(Settings.load(saved).output_dir) == PROJECT_ROOT / DOWNLOADS_DIRNAME,
+          Settings.load(saved).output_dir)
+
+    # Налаштування зі старим типовим значенням — абсолютним шляхом з чужого
+    # профілю — після перезапису стають переносними.
+    alien = tmp / "чужі.json"
+    alien.write_text(json.dumps({"output_dir": "Z:/Хтось/ProzorroDownloader"},
+                                ensure_ascii=False), encoding="utf-8")
+    check("чужа абсолютна тека лишається вибором користувача",
+          Settings.load(alien).output_dir.startswith("Z:"),
+          Settings.load(alien).output_dir)
 
 
 def test_one_date() -> None:
@@ -757,6 +1226,20 @@ def test_file_filter() -> None:
           == {".pdf", ".docx", ".xls", ".rtf"})
     check("порожній перелік", normalize_extensions(None) == set())
 
+    # Замовники раз у раз називають файл датою. Правило «усе після останньої
+    # крапки» робило з «…від 05.05.2026» розширення «.2026»: файл лягав на
+    # диск без розширення, а фільтр типів викидав його як «не PDF».
+    from app.core.downloader import extension_of, file_name_for
+    dated = {"title": "Протокол відхилення від 05.05.2026", "format": "application/pdf"}
+    check("дата в назві — не розширення", extension_of(dated["title"]) == "",
+          extension_of(dated["title"]))
+    check("тип беремо з MIME", document_extension(dated) == ".pdf", document_extension(dated))
+    check("і файл лягає з розширенням", file_name_for(dated).endswith(".pdf"),
+          file_name_for(dated))
+    check("цифри в розширенні дозволені", extension_of("архів.7z") == ".7z")
+    check("самі цифри — ні", extension_of("частина.5") == "")
+    check("надто довгий хвіст — не розширення", extension_of("назва.абвгдеєжзи") == "")
+
 
 def test_widgets() -> None:
     print("\n=== поля вводу ===")
@@ -772,8 +1255,18 @@ def test_widgets() -> None:
     check("порожнє поле — без обмеження", money.value() is None)
     money.setText("1 234 567")
     check("сума з пробілами", money.value() == 1234567.0, money.value())
+    # Кома — це роздільник копійок, а не ще один пробіл. Перевірка колись
+    # закріплювала протилежне: «50000,00» читалося як 5 000 000, і фільтр
+    # «від» виходив у сто разів більшим, ніж просив користувач.
     money.setText("50000,00")
-    check("сума з комою", money.value() == 5000000.0, money.value())
+    check("сума з комою", money.value() == 50000.0, money.value())
+    money.setText("1 234,56")
+    check("копійки не множать суму", money.value() == 1234.56, money.value())
+    money.setText("1234.56")
+    check("крапка теж роздільник копійок", money.value() == 1234.56, money.value())
+    money.set_value(1234.56)
+    check("копійки показуються, коли вони є", money.text() == "1 234,56", money.text())
+    check("і читаються назад без втрат", money.value() == 1234.56, money.value())
     money.set_value(1234567)
     formatted = money.text()
     digits = "".join(ch for ch in formatted if ch.isdigit())
@@ -890,19 +1383,20 @@ def test_report_stats() -> None:
     check("без розкиду немає викидів", max(robust_z([5] * 10)) == 0.0)
 
     check("коротка сума", compact(12_345_678).endswith("млн"), compact(12_345_678))
+    # Ділення на нуль десь у рушії не має перетворюватись на «inf млрд».
+    check("нескінченність — риска", compact(float("inf")) == "—", compact(float("inf")))
+    check("NaN — риска", compact(float("nan")) == "—", compact(float("nan")))
     check("відсоток", pct(0.1234) == "12,3%", pct(0.1234))
 
-    # Аркуші профілів зводяться в один, а не розкладаються по компанії.
+    # Гравець без блока — це рядок рейтингу, а не сторінка: портрет для нього
+    # не будувався, тож і аркуша в книзі бути не повинно.
     block = Block("Профіль")
     block.tables.append(("ТМ", (["Марка"], [["Vinga"]])))
     report = Report()
     report.competitors = [Profile(edrpou="1", name="А", block=block),
-                          Profile(edrpou="2", name="Б", block=block)]
-    sheets = report.sheets()
-    check("таблиці профілів зведені в один аркуш", len(sheets) == 1, list(sheets))
-    _name, (headers, rows) = next(iter(sheets.items()))
-    check("додано колонки компанії", headers[:2] == ["ЄДРПОУ", "Компанія"], headers)
-    check("рядки обох гравців", len(rows) == 2, rows)
+                          Profile(edrpou="2", name="Б")]
+    check("портрет є лише там, де є блок",
+          [bool(p.block) for p in report.competitors] == [True, False])
 
 
 def test_brands() -> None:
@@ -1020,7 +1514,10 @@ def test_insight(tmp: Path) -> None:
     data = xlsxload.load(_demo_workbook(tmp))
     report = insight.analyse(data, own_edrpou=["41263186"])
 
-    check("усі розділи на місці", len(report.sections) == 8, list(report.sections))
+    check("усі розділи на місці", len(report.sections) == 9, list(report.sections))
+    check("прогноз стоїть одразу за ринком",
+          list(report.sections).index("Прогнозування")
+          == list(report.sections).index("Ринок") + 1, list(report.sections))
     check("підсумок першим", list(report.sections)[0] == "Підсумок", list(report.sections))
 
     check("повна форма власності скорочується",
@@ -1075,9 +1572,154 @@ def test_insight(tmp: Path) -> None:
     check("є чесна позначка про межі аналізу",
           all(row[-1] == NEEDS_AI for row in compare[1]), compare[1][0][-1])
 
-    # Книга звіту не повинна розсипатися на аркуш під кожного гравця.
-    check("аркушів у вивантаженні небагато", len(report.sheets()) < 40,
-          len(report.sheets()))
+    # Книга звіту має вмістити все, що показує застосунок, — і жодного
+    # аркуша понад те: розділ, гравець із портретом і зміст.
+    from openpyxl import load_workbook
+
+    from app.core.reportbook import chart_table, write_report
+
+    path = tmp / "звіт-аналітики.xlsx"
+    write_report(path, report)
+    players = [p for p in [*report.ours, *report.competitors] if p.block]
+    blocks = [block for group in report.sections.values() for block in group]
+    blocks += [p.block for p in players]
+    want_tables = sum(1 for b in blocks for _name, s in b.tables if s and s[1])
+    want_charts = sum(1 for b in blocks for c in b.charts if chart_table(c)[1])
+    wb = load_workbook(path)
+    got_tables = sum(len(ws.tables) for ws in wb.worksheets)
+    # Оглядовий аркуш повторює діаграми розділів, тож рахуємо без нього:
+    # питання тут у тому, чи нічого не загубилося, а не скільки разів воно
+    # намальоване.
+    got_charts = sum(len(ws._charts) for ws in wb.worksheets if ws.title != "Графіки")
+    check("усі таблиці звіту потрапили в книгу", got_tables == want_tables,
+          f"{got_tables} з {want_tables}")
+    check("усі діаграми звіту потрапили в книгу", got_charts == want_charts,
+          f"{got_charts} з {want_charts}")
+    titles = {c.title for group in report.sections.values() for b in group
+              for c in b.charts if chart_table(c)[1]}
+    check("оглядовий аркуш зібрав кожен графік розділів рівно раз",
+          len(wb["Графіки"]._charts) == len(titles),
+          f"{len(wb['Графіки']._charts)} з {len(titles)}")
+    check("аркуш на зміст, огляд, розділ і гравця",
+          len(wb.sheetnames) == 2 + len(report.sections) + len(players),
+          wb.sheetnames)
+    wb.close()
+
+
+def _crowded_workbook(tmp: Path) -> Path:
+    """Книга, де наше ТОВ свідомо стоїть далеко за межею топ-15.
+
+    Двадцять конкурентів із сумами, що спадають, і одна маленька наша угода
+    в хвості: саме та вибірка, на якій наше ТОВ зникало з графіків.
+    """
+    from app.core.exporter import write_xlsx
+
+    players = [(f"{10000000 + i}", f"КОНКУРЕНТ {i:02d}", 900000.0 - i * 10000.0)
+               for i in range(20)]
+    players.append(("41263186", "НАШЕ ТОВ", 1000.0))
+
+    tenders, bids, contracts, items = [], [], [], []
+    for i, (edrpou, name, amount) in enumerate(players, start=1):
+        number = f"UA-2026-{i:04d}"
+        tenders.append([number, "2026-03-10", "Ноутбуки", "", "30213100-6",
+                        "Завершена", "Відкриті торги", "goods", amount * 1.1, "UAH",
+                        "так", "Замовник", "04527520", "Київська область", "Київ",
+                        0, 1, 0, "", "", "", ""])
+        bids.append([number, "2026-03-10", name, edrpou, "Київська область",
+                     amount, "UAH", "active", "2026-03-11"])
+        contracts.append([number, f"{number}-a1", name, edrpou, amount, "UAH",
+                          "active", "2026-03-20", "Замовник", "04527520",
+                          "Київська область", "30213100-6"])
+        items.append([number, "2026-03-10", "Ноутбук Vinga Iron S140", "30213100-6",
+                      "Портативні комп'ютери", 5, "штука", amount, amount / 5,
+                      "Замовник", "04527520", "Київська область"])
+
+    # Одне програне подання нашого ТОВ: ТМ звідти має потрапити в портфель,
+    # але не в число проданих марок.
+    bids.append(["UA-2026-0001", "2026-03-10", "НАШЕ ТОВ", "41263186",
+                 "Київська область", 950000.0, "UAH", "active", "2026-03-11"])
+    items.append(["UA-2026-0001", "2026-03-10", "Ноутбук Lenovo ThinkPad",
+                  "30213100-6", "Портативні комп'ютери", 5, "штука", 900000.0,
+                  180000.0, "Замовник", "04527520", "Київська область"])
+
+    path = tmp / "crowded.xlsx"
+    write_xlsx(path, {
+        "Закупівлі": (["Номер закупівлі", "Дата оприлюднення", "Предмет закупівлі",
+                       "Опис", "Коди ДК021", "Статус", "Процедура",
+                       "Категорія предмета", "Очікувана вартість", "Валюта",
+                       "ПДВ включено", "Замовник", "ЄДРПОУ замовника", "Регіон",
+                       "Населений пункт", "Лотів", "Пропозицій", "Файлів",
+                       "Початок подання", "Кінець подання", "Остання зміна",
+                       "Посилання"], tenders),
+        "Номенклатура": (["Номер закупівлі", "Дата", "Позиція", "Код ДК021",
+                          "Назва коду", "Кількість", "Одиниця",
+                          "Очікувана вартість лоту", "Ціна за одиницю", "Замовник",
+                          "ЄДРПОУ замовника", "Регіон"], items),
+        "Пропозиції": (["Номер закупівлі", "Дата закупівлі", "Учасник",
+                        "ЄДРПОУ учасника", "Регіон учасника", "Сума пропозиції",
+                        "Валюта", "Статус пропозиції", "Дата подання"], bids),
+        "Договори": (["Номер закупівлі", "Номер договору", "Постачальник",
+                      "ЄДРПОУ постачальника", "Сума договору", "Валюта",
+                      "Статус договору", "Дата підписання", "Замовник",
+                      "ЄДРПОУ замовника", "Регіон", "Коди ДК021"], contracts),
+    })
+    return path
+
+
+def test_ours_never_hidden(tmp: Path) -> None:
+    """Наше ТОВ видно на кожному графіку компаній, навіть поза топ-N."""
+    print("\n=== наші ТОВ не зникають з графіків ===")
+    from app.core import insight, xlsxload
+    from app.core.insight import TOP_ROWS
+    from app.core.players import TOP_RIVALS
+
+    data = xlsxload.load(_crowded_workbook(tmp))
+    report = insight.analyse(data, own_edrpou=["41263186"])
+    ours = next(p for p in report.ours if p.edrpou == "41263186")
+    check(f"наше ТОВ справді поза топ-{TOP_ROWS}", ours.rank > TOP_ROWS, ours.rank)
+
+    def chart(section: str, needle: str):
+        for block in report.sections[section]:
+            for item in block.charts:
+                if needle in item.title:
+                    return item
+        return None
+
+    for section, needle, limit in (("Ринок", "Топ-", TOP_ROWS),
+                                   ("Наші ТОВ", "Ми проти лідерів", TOP_RIVALS),
+                                   ("Конкуренти", "Найбільші конкуренти", TOP_RIVALS)):
+        item = chart(section, needle)
+        check(f"графік «{needle}…» є в розділі «{section}»", item is not None)
+        if not item:
+            continue
+        series = item.series[0]
+        spot = [i for i, label in enumerate(series.labels) if "НАШЕ" in label.upper()]
+        check(f"[{section}] наше ТОВ на графіку", len(spot) == 1, series.labels)
+        if not spot:
+            continue
+        # Головне правило: наше ТОВ дописане в хвіст, а не втиснуте в топ.
+        check(f"[{section}] воно стоїть за межею топ-{limit}", spot[0] >= limit, spot[0])
+        check(f"[{section}] воно підсвічене", spot[0] in series.accent, series.accent)
+        check(f"[{section}] номер місця видно в підписі",
+              f"№{ours.rank}" in series.labels[spot[0]], series.labels[spot[0]])
+        check(f"[{section}] решту топ-{limit} не обрізано",
+              len(series.labels) == limit + 1, len(series.labels))
+
+    # Друга правка: явна назва графіка про ТМ і період прямо в заголовку.
+    brands = chart("Порівняння", "товарних марок")
+    check("графік ТМ перейменовано", brands is not None,
+          [c.title for c in report.sections["Порівняння"][0].charts])
+    if brands:
+        check("у назві сказано, що рахується",
+              brands.title.startswith("Кількість різних товарних марок, проданих"),
+              brands.title)
+        check("у назві є період", "з 10.03.2026 до 20.03.2026" in brands.title,
+              brands.title)
+        check("слова «ширина портфеля» більше немає",
+              "ортфел" not in brands.title, brands.title)
+    # Програне подання дає ТМ у портфелі, але не в проданих марках.
+    check("портфель нашого ТОВ — дві ТМ", len(ours.brands) == 2, ours.brands)
+    check("продана — лише одна", len(ours.sold_brands) == 1, ours.sold_brands)
 
 
 def test_charts() -> None:
@@ -1113,6 +1755,23 @@ def test_charts() -> None:
     empty.resize(300, 200)
     empty.render(QPixmap(empty.size()))
     check("порожній графік не падає", True)
+
+    # Розрив у лінії — на ньому тримається графік прогнозу: факт займає ліву
+    # частину осі, прогноз із межами — праву, і жодна точка не має малюватися
+    # там, де значення немає. Нуль замість ``None`` намалював би обвал до осі.
+    gapped = ChartData("Факт і прогноз", "line", [
+        Series("Факт", ["01", "02", "03", "04"], [10.0, 12.0, 11.0, None]),
+        Series("Прогноз", ["01", "02", "03", "04"], [None, None, 11.0, 13.0])])
+    widget = build(gapped, "dark")
+    widget.resize(600, 300)
+    pixmap = QPixmap(widget.size())
+    widget.render(pixmap)
+    check("лінія з розривом малюється", not pixmap.isNull())
+    only_gaps = build(ChartData("Самі дірки", "line",
+                                [Series("Ряд", ["01", "02"], [None, None])]), "dark")
+    only_gaps.resize(300, 200)
+    only_gaps.render(QPixmap(only_gaps.size()))
+    check("ряд із самих дірок не падає", True)
 
     table = DataTable(["Компанія", "Сума угод, грн", "Частка"],
                       [["А", 1234.5, 0.25], ["Б", None, 0.75], ["В", 90000.0, 0.0]])
@@ -1478,7 +2137,12 @@ def test_degenerate(tmp: Path) -> None:
                              own_edrpou=["41263186"])
     check("порожня вибірка не валить аналіз", len(report.sections) == 8,
           list(report.sections))
-    check("у порожньому звіті немає таблиць", report.sheets() == {} or True)
+    # Книга з порожнього звіту має скластися: аркуші будуть, таблиць у них
+    # не буде — і це не помилка, а чесна відповідь «нічого не знайдено».
+    from app.core.reportbook import write_report
+    book = write_report(tmp / "порожній-звіт.xlsx", report)
+    check("книга з порожнього звіту записується", book.exists(),
+          book.stat().st_size)
 
     def tender(number: int, **kw):
         row = {"tender_id": f"UA-{number}", "date": "2026-03-01", "title": "Ноутбуки",
@@ -1692,36 +2356,348 @@ def test_cancel_midway(tmp: Path) -> None:
     check("а не всі вісім", len(seen) < 8, seen)
 
 
-def test_export_names() -> None:
+def test_export_names(tmp: Path) -> None:
     print("\n=== назви аркушів у вивантаженні ===")
+    from openpyxl import load_workbook
+
     from app.core.report import Block, Profile, Report
+    from app.core.reportbook import write_report
 
     report = Report()
-    long_name = "Дуже довга назва таблиці, яку Excel не подужає"
-    for _ in range(3):
-        block = Block("Блок")
-        block.tables.append((long_name, (["Колонка"], [["значення"]])))
-        report.add("Розділ", block)
+    # Назва розділу із символами, яких Excel не пускає в назву аркуша.
+    block = Block("Блок")
+    block.tables.append(("Таблиця", (["Колонка"], [["значення"]])))
+    report.add("Товари/ТМ: розбір [1]", block)
     # Порожні таблиці в книгу не потрапляють — інакше половина аркушів була б
     # порожньою.
     empty = Block("Порожній")
     empty.tables.append(("Без рядків", (["Колонка"], [])))
     report.add("Розділ", empty)
 
-    sheets = report.sheets()
-    check("однойменні таблиці не перетирають одна одну", len(sheets) == 3, list(sheets))
-    check("назви вкладаються в межу Excel",
-          all(len(name) <= 31 for name in sheets), list(sheets))
-    check("назви різні", len(set(sheets)) == 3, list(sheets))
-    check("порожня таблиця не стала аркушем",
-          "Без рядків" not in sheets, list(sheets))
+    # Два конкуренти з однаковою довгою назвою — класика реєстру: та сама
+    # мережа під різними ЄДРПОУ.
+    long_name = "Дуже довга назва компанії, яку Excel не подужає"
+    people = []
+    for edrpou in ("1", "2"):
+        profile = Profile(edrpou=edrpou, name=long_name, block=Block("Портрет"))
+        profile.block.tables.append(("Угоди", (["Сума, грн"], [[1]])))
+        people.append(profile)
+    report.competitors = people
 
-    profile = Profile(edrpou="1", name="А", block=Block("П"))
-    profile.block.tables.append(("Угоди", (["Сума"], [[1]])))
-    report.competitors = [profile]
-    check("таблиця профілю додається окремим аркушем",
-          any(name.startswith("Угоди") for name in report.sheets()),
-          list(report.sheets()))
+    path = write_report(tmp / "назви.xlsx", report)
+    names = load_workbook(path).sheetnames
+    check("назви вкладаються в межу Excel", all(len(n) <= 31 for n in names), names)
+    check("назви різні", len(set(names)) == len(names), names)
+    check("заборонені символи прибрано",
+          not any(set(n) & set("[]:*?/\\") for n in names), names)
+    check("аркуш на зміст, огляд, розділ і кожного гравця", len(names) == 6, names)
+
+
+def _demo_report():
+    """Звіт з усіма типами діаграм — щоб перевірити книгу цілком."""
+    from app.core.report import Block, ChartData, Profile, Report, Series
+
+    block = Block("Ринок у цифрах", "Що видно з очищених даних.")
+    block.tiles = [("Сума угод", "12,3 млн грн")]
+    block.notes = ["Три гравці тримають 41% ринку."]
+    block.charts = [
+        ChartData("Топ постачальників", "hbar",
+                  [Series("Сума угод", ["ТОВ А", "ТОВ Б"], [900.0, 750.0],
+                          accent={1})], unit="грн"),
+        ChartData("Закупівель по місяцях", "bar",
+                  [Series("Закупівель", ["01", "02"], [10, 20])],
+                  unit="шт", money_axis=False),
+        ChartData("Процедури", "pie",
+                  [Series("Сума", ["відкриті", "без торгів"], [5.0, 3.0])], unit="грн"),
+        ChartData("Динаміка", "line",
+                  [Series("План", ["01", "02"], [1.0, 2.0]),
+                   Series("Факт", ["01", "02"], [1.0, 1.5])], unit="грн"),
+        ChartData("Накопичено", "area",
+                  [Series("Сума", ["01", "02"], [1.0, 3.0])], unit="грн"),
+        ChartData("Дисконт", "hbar", [Series("Дисконт", ["ТОВ А"], [12.5])],
+                  unit="%", money_axis=False),
+        ChartData("Ціна проти кількості", "scatter",
+                  [Series("Позиції",
+                          points=[(float(i), float(i % 7)) for i in range(3000)],
+                          accent={1, 2})], money_axis=False),
+        ChartData("Порожній", "bar", [Series("Нічого", [], [])]),
+    ]
+    block.tables = [
+        ("Рейтинг", (["Компанія", "Сума угод, грн", "Частка"],
+                     [["ТОВ А", 900.0, 0.45], ["=ТОВ Б", 750.5, 0.37]])),
+        ("Порожня", (["Колонка"], [])),
+    ]
+    report = Report(source="дані.xlsx", generated="2026-08-31 15:00",
+                    period=("2026-01-01", "2026-08-31"))
+    report.notes = ["Курс валют не перераховувався."]
+    # «Підсумок» переносить до себе графіки з інших розділів — саме так це
+    # робить `Analyzer.summary`, і саме через це оглядовий аркуш мусить
+    # відсіювати повтори.
+    digest = Block("Головне")
+    digest.charts = [block.charts[0],
+                     ChartData("Ми проти ринку", "hbar",
+                               [Series("Сума", ["ТОВ А"], [900.0])], unit="грн")]
+    report.add("Підсумок", digest)
+    report.add("Ринок", block)
+
+    profile = Profile(edrpou="1234", name="ТОВ А", is_ours=True, rank=1,
+                      block=Block("Портрет"), strengths=["широкий портфель ТМ"])
+    profile.block.charts.append(
+        ChartData("Ключові замовники", "hbar",
+                  [Series("Сума", ["Лікарня"], [10.0])], unit="грн"))
+    profile.block.tables.append(("Угоди", (["Закупівля", "Сума, грн"], [["UA-1", 10.0]])))
+    report.ours = [profile]
+    return report
+
+
+def test_report_overview(tmp: Path) -> None:
+    print("\n=== оглядовий аркуш: усі графіки звіту в одному місці ===")
+    from openpyxl import load_workbook
+
+    from app.core.reportbook import write_report
+
+    path = write_report(tmp / "огляд.xlsx", _demo_report())
+    wb = load_workbook(path)
+    check("аркуш «Графіки» стоїть одразу за змістом",
+          wb.sheetnames[:2] == ["Зміст", "Графіки"], wb.sheetnames[:3])
+    overview = wb["Графіки"]
+
+    def title_of(chart) -> str:
+        """Назва діаграми текстом: після читання книги вона — дерево об'єктів."""
+        try:
+            return "".join(run.t or "" for para in chart.title.tx.rich.p
+                           for run in (para.r or ()))
+        except AttributeError:
+            return ""
+
+    # «Топ постачальників» стоїть і в «Підсумку», і в «Ринку» — на огляді має
+    # бути один раз.
+    titles = [title_of(chart) for chart in overview._charts]
+    check("зібрано всі графіки розділів", len(titles) == 8, titles)
+    check("повтор між розділами відсіяно", len(set(titles)) == 8, sorted(titles))
+    check("спільний графік узятий із першого розділу",
+          titles.count("Топ постачальників") == 1, titles)
+    check("порожній графік не потрапив і сюди", "Порожній" not in titles, titles)
+
+    # Головне: аркуш не переписує до себе даних — інакше хмара на тисячу
+    # рядків відсунула б усе наступне за обрій.
+    numbers = [overview.cell(row=r, column=c).value
+               for r in range(1, overview.max_row + 1)
+               for c in range(1, 25)
+               if isinstance(overview.cell(row=r, column=c).value, (int, float))]
+    check("даних на аркуші немає — лише малюнки", numbers == [], numbers[:5])
+
+    def sources(chart) -> set[str]:
+        out = set()
+        for item in chart.series:
+            for holder in (item.cat, item.val, item.xVal, item.yVal):
+                ref = getattr(holder, "numRef", None) or getattr(holder, "strRef", None)
+                if ref and ref.f and "!" in ref.f:
+                    out.add(ref.f.split("!")[0].strip("'"))
+        return out
+
+    used = {name for chart in overview._charts for name in sources(chart)}
+    check("кожна діаграма читає дані свого розділу",
+          used and "Графіки" not in used, sorted(used))
+    check("розділи-джерела всі на місці", used == {"Підсумок", "Ринок"}, sorted(used))
+
+    spots = [(chart.anchor._from.col, chart.anchor._from.row)
+             for chart in overview._charts]
+    check("діаграми стоять у дві колонки",
+          {col for col, _row in spots} == {0, 12}, sorted({c for c, _r in spots}))
+    check("жодна не лягла поверх іншої", len(set(spots)) == len(spots), spots)
+
+    contents = [wb["Зміст"].cell(row=r, column=2).value
+                for r in range(1, wb["Зміст"].max_row + 1)]
+    check("огляд названо у змісті", "Усі графіки звіту" in contents, contents)
+    wb.close()
+
+
+def test_report_book(tmp: Path) -> None:
+    print("\n=== книга звіту: діаграми праворуч від своїх даних ===")
+    from openpyxl import load_workbook
+    from openpyxl.utils import column_index_from_string
+
+    from app.core.reportbook import SCATTER_CAP, write_report
+
+    report = _demo_report()
+    path = write_report(tmp / "звіт.xlsx", report)
+    wb = load_workbook(path)
+    market = wb["Ринок"]
+
+    kinds = [type(chart).__name__ for chart in market._charts]
+    check("кожен графік став діаграмою Excel", len(kinds) == 7, kinds)
+    check("типи діаграм збережено",
+          sorted(kinds) == ["AreaChart", "BarChart", "BarChart", "BarChart",
+                            "LineChart", "PieChart", "ScatterChart"], sorted(kinds))
+    check("порожній графік пропущено", "Порожній" not in
+          [market.cell(row=r, column=1).value for r in range(1, market.max_row + 1)])
+    check("смугова діаграма горизонтальна",
+          [c.type for c in market._charts if type(c).__name__ == "BarChart"].count("bar") == 2,
+          [getattr(c, "type", "") for c in market._charts])
+
+    def used_columns(chart) -> int:
+        """Найправіша колонка, з якої діаграма бере числа."""
+        right = 0
+        for item in chart.series:
+            for holder in (item.cat, item.val, item.xVal, item.yVal):
+                ref = getattr(holder, "numRef", None) or getattr(holder, "strRef", None)
+                if not ref or not ref.f:
+                    continue
+                for cell in ref.f.split("!")[-1].replace("$", "").split(":"):
+                    letters = "".join(ch for ch in cell if ch.isalpha())
+                    right = max(right, column_index_from_string(letters))
+        return right
+
+    placed = [(chart.anchor._from.col + 1, used_columns(chart))
+              for chart in market._charts]
+    check("діаграма стоїть праворуч від своїх даних",
+          all(anchor > data for anchor, data in placed), placed)
+
+    # Таблиця даних під діаграмою — та сама, з якої вона намальована.
+    labels = {market.cell(row=r, column=1).value for r in range(1, market.max_row + 1)}
+    check("дані діаграми лежать поруч у книзі", {"ТОВ А", "ТОВ Б"} <= labels)
+    percent = next(market.cell(row=r, column=2) for r in range(1, market.max_row + 1)
+                   if market.cell(row=r, column=2).value == 12.5)
+    check("відсотки графіка не множаться вдруге",
+          percent.number_format == '0.0"%"', percent.number_format)
+
+    excel_table = next(iter(market.tables.values()))
+    table = excel_table.ref
+    top = int("".join(ch for ch in table.split(":")[0] if ch.isdigit())) + 1
+    # Стрілки відбору openpyxl додає лише тоді, коли сам вигадує колонки;
+    # ми описуємо колонки самі, тож і фільтр маємо ставити самі.
+    check("у таблиці є стрілки відбору",
+          excel_table.autoFilter is not None and excel_table.autoFilter.ref == table,
+          excel_table.autoFilter)
+    check("колонки таблиці названі як заголовки",
+          [c.name for c in excel_table.tableColumns] == ["Компанія", "Сума угод, грн",
+                                                         "Частка"],
+          [c.name for c in excel_table.tableColumns])
+    check("частка в таблиці — відсотком",
+          market.cell(row=top, column=3).number_format == "0.0%",
+          market.cell(row=top, column=3).number_format)
+    check("сума з копійками там, де вони є",
+          market.cell(row=top, column=2).number_format == "#,##0.00",
+          market.cell(row=top, column=2).number_format)
+    check("текст із «=» не став формулою",
+          market.cell(row=top + 1, column=1).value == "=ТОВ Б",
+          market.cell(row=top + 1, column=1).value)
+
+    scatter = next(chart for chart in market._charts
+                   if type(chart).__name__ == "ScatterChart")
+    span = scatter.series[0].xVal.numRef.f.split("!")[-1].replace("$", "").split(":")
+    written = int("".join(ch for ch in span[1] if ch.isdigit())) - \
+        int("".join(ch for ch in span[0] if ch.isdigit())) + 1
+    check("хмару проріджено до межі", written <= SCATTER_CAP, written)
+
+    check("портрет гравця став аркушем", "Ми1 ТОВ А" in wb.sheetnames, wb.sheetnames)
+    check("порожня таблиця не потрапила в книгу",
+          sum(len(ws.tables) for ws in wb.worksheets) == 2,
+          {ws.title: len(ws.tables) for ws in wb.worksheets})
+    ours = wb["Ми1 ТОВ А"]
+    column = [ours.cell(row=r, column=1).value for r in range(1, ours.max_row + 1)]
+    check("сильні сторони перенесені", "+  широкий портфель ТМ" in column, column)
+    check("зміст веде на аркуші",
+          any(str(wb["Зміст"].cell(row=r, column=3).value or "").startswith("=HYPERLINK")
+              for r in range(1, wb["Зміст"].max_row + 1)))
+    wb.close()
+
+
+def test_profile_book(tmp: Path) -> None:
+    print("\n=== книга по одній компанії ===")
+    from openpyxl import load_workbook
+
+    from app.core.report import Profile
+    from app.core.reportbook import write_profile_report
+
+    report = _demo_report()
+    # Назва довша за межу Excel і з символами, яких він не пускає в аркуш.
+    profile = report.ours[0]
+    profile.name = "ТОВ «ТОРГОВИЙ ДІМ/ПАРТНЕР: АЙ ТІ» та інші дуже довгі слова"
+    profile.weaknesses = ["вузька географія"]
+    path = write_profile_report(tmp / "компанія.xlsx", report, profile)
+    wb = load_workbook(path)
+
+    check("у книзі один аркуш — сама компанія", len(wb.sheetnames) == 1, wb.sheetnames)
+    check("назва аркуша прийнятна для Excel",
+          len(wb.sheetnames[0]) <= 31 and not set(wb.sheetnames[0]) & set("[]:*?/\\"),
+          wb.sheetnames)
+    ws = wb.worksheets[0]
+    column = [ws.cell(row=r, column=1).value for r in range(1, ws.max_row + 1)]
+    want_charts = sum(1 for c in profile.block.charts if c.series)
+    check("діаграми компанії на місці", len(ws._charts) == want_charts,
+          f"{len(ws._charts)} з {want_charts}")
+    check("таблиці компанії на місці", len(ws.tables) == len(profile.block.tables),
+          f"{len(ws.tables)} з {len(profile.block.tables)}")
+    check("сильні та слабкі сторони перенесені",
+          "+  широкий портфель ТМ" in column and "−  вузька географія" in column, column)
+    check("видно, звідки й за який період дані",
+          any("дані.xlsx" in str(v or "") and "2026-01-01" in str(v or "")
+              for v in column), column[:4])
+    check("аркуша «Зміст» тут немає", "Зміст" not in wb.sheetnames, wb.sheetnames)
+    wb.close()
+
+    # Гравець без портрета трапляється: у рейтингу він є, сторінки в нього немає.
+    empty = write_profile_report(tmp / "без-блоку.xlsx", report,
+                                 Profile(edrpou="9999", name="Без блоку"))
+    check("гравець без портрета не валить запис", empty.exists())
+
+
+def test_profile_export_button(tmp: Path) -> None:
+    print("\n=== кнопка «Зберегти звіт по компанії» ===")
+    from openpyxl import load_workbook
+    from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QPushButton
+
+    from app.config import Settings
+    from app.ui.pages import analytics_page as page_module
+    from app.ui.pages.analytics_page import AnalyticsPage
+
+    QApplication.instance() or QApplication([])
+    report = _demo_report()
+    page = AnalyticsPage(Settings())
+    page.report = report
+    page.show_report(report)
+
+    profile = report.ours[0]
+    widget = page._profile_widget(profile)
+    buttons = [b for b in widget.findChildren(QPushButton) if "компані" in b.text()]
+    check("на сторінці компанії є кнопка звіту", len(buttons) == 1,
+          [b.text() for b in widget.findChildren(QPushButton)])
+
+    saved = tmp / "звіт-по-компанії.xlsx"
+    shown: list[str] = []
+
+    # Діалоги в тесті нікому показувати: підміняємо їх на місці, у просторі
+    # імен сторінки, і повертаємо назад одразу після натискання.
+    class Dialog:
+        @staticmethod
+        def getSaveFileName(*_args, **_kw):
+            return str(saved), ""
+
+    class Box:
+        @staticmethod
+        def information(_parent, _title, text=""):
+            shown.append(text)
+
+        @staticmethod
+        def critical(_parent, _title, text=""):
+            shown.append("ПОМИЛКА: " + text)
+
+    page_module.QFileDialog, page_module.QMessageBox = Dialog, Box
+    try:
+        buttons[0].click()
+    finally:
+        page_module.QFileDialog, page_module.QMessageBox = QFileDialog, QMessageBox
+
+    check("натискання зберегло книгу", saved.exists(), shown[:1])
+    check("під час запису не було помилок",
+          not any(s.startswith("ПОМИЛКА") for s in shown), shown)
+    if saved.exists():
+        book = load_workbook(saved)
+        check("у книзі аркуш саме цієї компанії", len(book.sheetnames) == 1,
+              book.sheetnames)
+        book.close()
 
 
 def test_number_formats() -> None:
@@ -2352,7 +3328,7 @@ def test_analytics_is_file_only(tmp: Path) -> None:
         report = insight.analyse(data, own_edrpou=["41263186"])
     finally:
         sqlite3.connect = original
-    check("аналіз пройшов без жодного дотику до sqlite", len(report.sections) == 8,
+    check("аналіз пройшов без жодного дотику до sqlite", len(report.sections) == 9,
           list(report.sections))
     ranking = dict(report.sections["Ринок"][0].tables)["Рейтинг постачальників"][1]
     check("і порахував саме те, що у файлі", ranking[0][6] == 95000.0, ranking)
@@ -2377,6 +3353,873 @@ def test_analytics_is_file_only(tmp: Path) -> None:
           {row[1] for row in ranking2})
 
 
+def test_forecast_models() -> None:
+    print("\n=== моделі прогнозу ===")
+    from app.core import forecast as fc
+
+    # Квантиль Стьюдента звіряємо з друкованою таблицею: на ньому тримається
+    # ширина всіх інтервалів, і помилка тут була б непомітною й системною.
+    check("квантиль Стьюдента t(0,90; 4)", abs(fc.t_quantile(0.90, 4) - 1.5332) < 5e-4,
+          round(fc.t_quantile(0.90, 4), 4))
+    check("квантиль Стьюдента t(0,975; 10)", abs(fc.t_quantile(0.975, 10) - 2.2281) < 5e-4,
+          round(fc.t_quantile(0.975, 10), 4))
+    check("квантиль ширший за нормальний", fc.t_quantile(0.90, 4) > 1.2816)
+
+    months = [fc.month_shift("2026-01", i) for i in range(12)]
+    check("наступний місяць після грудня", fc.month_next("2026-12") == "2027-01")
+
+    # Точна пряма: модель із трендом зобов'язана продовжити її без похибки.
+    line = [10.0 + 2 * i for i in range(10)]
+    out = fc.forecast("пряма", months[:10], line, horizon=3)
+    check("пряма продовжується точно",
+          abs(out.points[0].value - 30.0) < 1e-6 and abs(out.points[2].value - 34.0) < 1e-6,
+          [p.value for p in out.points])
+    check("на прямій похибка нульова", out.mase is not None and out.mase < 1e-6, out.mase)
+    check("тренд у прогнозі додатний", out.trend and out.trend > 0, out.trend)
+
+    # Усі моделі мають міритися на однаковій кількості звірок — інакше та,
+    # що почала пізніше, виграє на коротшому й легшому хвості ряду.
+    checks = {s.checks for s in out.scores if s.mase is not None}
+    check("усі моделі перевірено однаково", len(checks) == 1, checks)
+
+    # Стала: жодна модель не має вигадати тренду.
+    flat = fc.forecast("стала", months[:8], [5.0] * 8, horizon=3)
+    check("стала лишається сталою",
+          all(abs(p.value - 5.0) < 1e-9 for p in flat.points), [p.value for p in flat.points])
+    check("на сталому ряду сказано, що він сталий",
+          any("сталий" in note for note in flat.notes), flat.notes)
+
+    # Оптимальний старт: перше спостереження — викид, і рівень не має за нього
+    # чіплятися. Саме тут прогноз ринку помилявся на 8%.
+    ses = fc.Ses().fit([1.0, 9.0, 10.0, 11.0, 9.0, 10.0])
+    check("рівень не прив'язаний до першої точки", ses.predict(1)[0] > 6.0,
+          round(ses.predict(1)[0], 3))
+
+    # Замало місяців — чесна відмова, а не число з повітря.
+    short = fc.forecast("короткий", months[:2], [1.0, 2.0], horizon=3)
+    check("два місяці — прогнозу немає", not short.ok and short.reason, short.reason)
+    gap = fc.forecast("з діркою", ["2026-01", "2026-02", "2026-05"], [1.0, 2.0, 3.0])
+    check("розрив у ряду — прогнозу немає", not gap.ok and "розрив" in gap.reason, gap.reason)
+
+    # Спадний ряд не має давати від'ємних грошей.
+    falling = fc.forecast("спад", months[:8], [80.0, 70.0, 60.0, 50.0, 40.0, 30.0, 20.0, 10.0],
+                          horizon=6)
+    check("прогноз не йде нижче нуля",
+          all(p.value >= 0 and p.low >= 0 for p in falling.points),
+          [(p.value, p.low) for p in falling.points])
+
+    # Інтервал має розширюватися з горизонтом — інакше він не інтервал.
+    noisy = [10.0, 13.0, 9.0, 14.0, 11.0, 15.0, 10.0, 16.0, 12.0, 17.0]
+    wide = fc.forecast("шум", months[:10], noisy, horizon=4)
+    spans = [p.high - p.low for p in wide.points]
+    check("межі розходяться з горизонтом", spans[-1] >= spans[0] - 1e-9,
+          [round(s, 2) for s in spans])
+    check("прогноз усередині своїх меж",
+          all(p.low <= p.value <= p.high for p in wide.points))
+
+
+def test_forecast_choice_risk() -> None:
+    print("\n=== межі враховують і невизначеність вибору моделі ===")
+    from app.core import forecast as fc
+
+    months = [fc.month_shift("2026-01", i) for i in range(12)]
+    flat, drift = fc.Flat(), fc.Drift()
+
+    # Смуга з однієї моделі — сперечатися нема з ким.
+    y = [10.0, 11.0, 9.0, 10.5, 10.0, 9.5, 10.2, 10.1]
+    alone = fc._rival_spread(y, [flat], flat, 3, flat.fit(y).predict(3))
+    check("одна модель — розкиду немає", alone == [0.0, 0.0, 0.0], alone)
+
+    # Стала проти дрейфу на ряду з нахилом: що далі горизонт, то дужче вони
+    # розходяться — і саме на стільки має рости інтервал.
+    slope = [10.0 + 2 * i for i in range(8)]
+    pair = fc._rival_spread(slope, [flat, drift], flat, 3, flat.fit(slope).predict(3))
+    check("моделі розходяться — розкид додатний", pair[0] > 0, [round(v, 2) for v in pair])
+    check("розкид росте з горизонтом", pair[2] > pair[1] > pair[0],
+          [round(v, 2) for v in pair])
+
+    # Наскрізь: та сама вибірка з урахуванням вибору й без нього.
+    noisy = [10.0, 13.0, 9.0, 14.0, 11.0, 15.0, 10.0, 16.0, 12.0, 17.0, 13.0, 18.0]
+    honest = fc.forecast("шум", months, noisy, horizon=3)
+    original = fc._rival_spread
+    try:
+        fc._rival_spread = lambda *a, **k: [0.0] * a[3]
+        naive_bounds = fc.forecast("шум", months, noisy, horizon=3)
+    finally:
+        fc._rival_spread = original
+    wide = honest.points[0].high - honest.points[0].low
+    narrow = naive_bounds.points[0].high - naive_bounds.points[0].low
+    check("суперників пораховано", honest.rivals >= 1, honest.rivals)
+    check("врахування вибору не звужує інтервал", wide >= narrow - 1e-9,
+          (round(wide, 2), round(narrow, 2)))
+    if honest.rivals > 1:
+        check("а коли моделі сперечаються — розширює", wide > narrow,
+              (round(wide, 2), round(narrow, 2)))
+    check("точка прогнозу від цього не зсувається",
+          abs(honest.points[0].value - naive_bounds.points[0].value) < 1e-9,
+          (honest.points[0].value, naive_bounds.points[0].value))
+
+
+def test_forecast_seasonality() -> None:
+    print("\n=== сезонність вмикається сама ===")
+    import time
+    from app.core import forecast as fc
+
+    # Три роки з грудневим сплеском: рівно те, чого не видно на пів року.
+    spike = [0.0] * 11 + [60.0]
+    y = [100.0 + 3 * t + spike[t % 12] for t in range(36)]
+    months = [fc.month_shift("2024-01", i) for i in range(36)]
+    started = time.time()
+    out = fc.forecast("сезонний", months, y, horizon=3)
+    spent = time.time() - started
+    check("сезонні моделі з'явилися в наборі",
+          any("езонн" in s.model for s in out.scores), [s.model for s in out.scores])
+    check("обрано сезонну модель", "езонн" in out.model, out.model)
+    # Наступний за груднем місяць — січень без сплеску: несезонна модель
+    # потягнула б грудневі +60 далі.
+    check("січень після грудня без сплеску", out.points[0].value < 100 + 3 * 36 + 30,
+          round(out.points[0].value, 1))
+    check("сезонний прогноз близький до правди",
+          abs(out.points[0].value - (100 + 3 * 36)) < 25, round(out.points[0].value, 1))
+    check("на 36 точках звірок уже вистачає", out.checks >= 6, out.checks)
+    check("перебір сітки не гальмує", spent < 20.0, f"{spent:.1f} с")
+
+    # На пів року сезонні моделі не мають вмикатися взагалі.
+    half = fc.forecast("пів року", months[:6], y[:6], horizon=3)
+    check("на 6 місяцях сезонності немає",
+          not any("езонн" in s.model for s in half.scores), [s.model for s in half.scores])
+
+
+def _lagged_workbook(tmp: Path) -> Path:
+    """Вісім місяців із відомою затримкою договору — рівно 10 днів.
+
+    Закупівлі виходять 1, 15 і 25 числа, договір з'являється через десять
+    днів. Останню серпневу закупівлю (25.08) договір ще не наздогнав — саме
+    та ситуація, через яку останній місяць будь-якої вибірки виглядає
+    провальним. Тут вона відтворена так, що правильну відповідь можна
+    порахувати на папері: видно дві закупівлі з трьох, тобто дві третини.
+    """
+    from app.core.exporter import write_xlsx
+
+    days = ("01", "15", "25")
+    rows, deals = [], []
+    for month in range(1, 9):
+        for day in days:
+            code = f"UA-2026-{month:02d}-{day}"
+            rows.append([code, f"2026-{month:02d}-{day}", "Ноутбуки", "", "30213100-6",
+                         "Завершена", "Звіт про договір", "goods", 100000.0, "UAH",
+                         "так", "Замовник", "04527520", "Київська область", "Київ",
+                         0, 1, 0, "", "", "", ""])
+            signed = date(2026, month, int(day)) + timedelta(days=10)
+            if signed <= date(2026, 8, 25):
+                deals.append([code, code + "-a1", RIVAL, "12345678", 90000.0, "UAH",
+                              "active", signed.isoformat(), "Замовник", "04527520",
+                              "Київська область", "30213100-6"])
+    tenders = (["Номер закупівлі", "Дата оприлюднення", "Предмет закупівлі", "Опис",
+                "Коди ДК021", "Статус", "Процедура", "Категорія предмета",
+                "Очікувана вартість", "Валюта", "ПДВ включено", "Замовник",
+                "ЄДРПОУ замовника", "Регіон", "Населений пункт", "Лотів",
+                "Пропозицій", "Файлів", "Початок подання", "Кінець подання",
+                "Остання зміна", "Посилання"], rows)
+    contracts = (["Номер закупівлі", "Номер договору", "Постачальник",
+                  "ЄДРПОУ постачальника", "Сума договору", "Валюта",
+                  "Статус договору", "Дата підписання", "Замовник",
+                  "ЄДРПОУ замовника", "Регіон", "Коди ДК021"], deals)
+    path = tmp / "lagged.xlsx"
+    write_xlsx(path, {"Закупівлі": tenders, "Договори": contracts})
+    return path
+
+
+def test_forecast_completeness(tmp: Path) -> None:
+    print("\n=== поправка на неповноту останніх місяців ===")
+    from app.core import insight, xlsxload
+
+    data = xlsxload.load(_lagged_workbook(tmp))
+    report = insight.analyse(data, own_edrpou=["41263186"], horizon=2)
+    blocks = report.sections["Прогнозування"]
+    check("розділ прогнозу з двох блоків і більше", len(blocks) >= 2, len(blocks))
+
+    curve = dict(blocks[1].tables)["Крива розвитку договорів"][1]
+    known = {row[0]: row[1] for row in curve}
+    check("до десятого дня не видно нічого", known.get(7) == 0.0, known)
+    check("на десятий день видно все", known.get(10) == 1.0, known)
+
+    full = dict(blocks[1].tables)["Повнота місяців"][1]
+    august = [row for row in full if row[0] == "2026-08" and row[1] == "Сума угод"]
+    check("серпень позначено неповним", len(august) == 1, full)
+    if august:
+        row = august[0]
+        check("розвиток серпня — дві третини", abs(row[4] - 2 / 3) < 0.005, row[4])
+        check("вибірка уривається посеред серпня", 0.5 < row[3] < 1.0, row[3])
+        check("спостережено дві угоди з трьох", row[2] == 180000.0, row[2])
+        check("поправка піднімає, а не опускає", row[6] > row[2], (row[2], row[6]))
+        # У таблиці частки округлені до чотирьох знаків, тож звіряємо
+        # відносно: точне ділення дало б розбіжність у сотню гривень.
+        check("поправка — це ділення на повноту",
+              abs(row[6] / (row[2] / (row[3] * row[4])) - 1) < 0.005,
+              (row[6], round(row[2] / (row[3] * row[4]), 2)))
+    older = [row for row in full if row[0] < "2026-08" and row[4] < 0.999]
+    check("зрілі місяці не коригуються за розвитком", not older, older)
+
+    points = dict(blocks[0].tables)["Прогноз по місяцях"][1]
+    ahead = {row[1] for row in points if row[0] == "Сума угод"}
+    check("прогноз рівно на заданий горизонт", ahead == {"2026-09", "2026-10"}, ahead)
+
+    # Зворотна перевірка: програма вдає, що збір урвався кінцем липня, і
+    # звіряє скориговане число з тим, що в липні опинилося насправді. На цих
+    # даних відповідь відома точно — договір відстає рівно на десять днів,
+    # тож видно дві закупівлі з трьох, а поправка має влучити в яблучко.
+    check_sheet = dict(blocks[1].tables).get("Перевірка поправки")
+    check("поправку перевірено ретроспективно", bool(check_sheet and check_sheet[1]),
+          check_sheet[1] if check_sheet else None)
+    if check_sheet and check_sheet[1]:
+        row = check_sheet[1][0]
+        check("без поправки місяць недорахований на третину",
+              abs(row[4] + 1 / 3) < 0.01, row[4])
+        check("з поправкою похибки немає", abs(row[5]) < 0.01, row[5])
+        check("скориговане збігається з тим, що виявилося насправді",
+              abs(row[2] - row[3]) < 1.0, (row[2], row[3]))
+    check("перевірка не підглядає в майбутнє",
+          all(r[1] < r[3] for r in (check_sheet[1] if check_sheet else [])),
+          check_sheet[1] if check_sheet else None)
+
+    chart = next(c for c in blocks[0].charts if c.title.startswith("Сума угод"))
+    rows_by_name = {s.name: s for s in chart.series}
+    labels = rows_by_name["Факт"].labels
+    check("вісь без повторів і за зростанням",
+          labels == sorted(set(labels)) and len(labels) == 10, labels)
+    fact = rows_by_name["Факт"].values
+    line = rows_by_name["Прогноз"].values
+    check("факт закінчується там, де починається прогноз",
+          fact[-1] is None and fact[-3] is not None and line[-1] is not None
+          and line[-4] is None, (fact[-4:], line[-4:]))
+    check("лінії стикаються в останньому факті", line[-3] is not None, line[-4:])
+
+    # Прогноз відходить не від видимої частини останнього місяця, а від
+    # оцінки повного — інакше модель продовжувала б обірваний ряд. Щоб це не
+    # читалося як розрив, скоригований ряд іде суцільно через усю історію.
+    fixed = rows_by_name["Оцінка повного місяця"]
+    check("поправка малюється під фактом, а не поверх нього",
+          chart.series.index(fixed) < chart.series.index(rows_by_name["Факт"]),
+          [s.name for s in chart.series])
+    history = len(labels) - 2
+    check("скоригований ряд суцільний по всій історії",
+          all(v is not None for v in fixed.values[:history])
+          and all(v is None for v in fixed.values[history:]),
+          fixed.values)
+    check("прогноз стартує саме зі скоригованої точки",
+          line[history - 1] == fixed.values[history - 1] > fact[history - 1],
+          (line[history - 1], fixed.values[history - 1], fact[history - 1]))
+
+
+def test_rejection_reasons() -> None:
+    print("\n=== причини відмов: розбір формулювання ===")
+    from app.core import rejections as rj
+
+    # Формулювання з живих карток (02.09.2026): у вибірці 72 відмов саме ці
+    # чотири підстави й трапилися.
+    check("відмова від договору",
+          rj.classify("Переможець письмово відмовився від укладення договору на умовах, "
+                      "визначених замовником у запиті пропозицій постачальників")
+          == "Відмова від договору")
+    check("не підписав договір",
+          rj.classify("Переможець не підписав договір, на умовах, визначених замовником "
+                      "у запиті пропозицій постачальників, у строк, визначений пунктом 66")
+          == "Не підписав договір у строк")
+    check("технічна специфікація",
+          rj.classify("Тендерна пропозиція учасника не відповідає умовам технічної "
+                      "специфікації та іншим вимогам щодо предмета закупівлі тендерної "
+                      "документації") == "Невідповідність технічним вимогам")
+    check("умови оголошення",
+          rj.classify("Пропозиція учасника не відповідає умовам, визначеним в оголошенні "
+                      "про проведення спрощеної закупівлі, та вимогам до предмета закупівлі")
+          == "Невідповідність вимогам документації")
+    check("підстави статті 17",
+          rj.classify("Не надав у спосіб, зазначений в тендерній документації, документи, "
+                      "що підтверджують відсутність підстав, визначених у підпунктах 3, 5, "
+                      "6 і 12 пункту 47 Особливостей") == "Не надав документи")
+    # Обидві підстави посилаються на той самий пункт 47, але кажуть протилежне:
+    # одна — «він не довів, що не такий», друга — «він таки такий». Голе
+    # посилання на пункт колись відносило другу до першої.
+    check("підпадає під підстави — не те саме, що не надав довідку",
+          rj.classify("Учасник підпадає під підстави, встановлені пунктом 47 Особливостей")
+          == "Підпадає під підстави для відмови")
+    check("голе посилання на пункт нічого не вигадує",
+          rj.classify("Відхилено на підставі пункту 47 Особливостей") == rj.OTHER)
+
+    # Підстави з пункту 44 Особливостей, яких у цій вибірці не було, але які
+    # трапляються на інших ринках.
+    check("недостовірна інформація",
+          rj.classify("Учасник зазначив у тендерній пропозиції недостовірну інформацію")
+          == "Недостовірна інформація")
+    check("не усунув невідповідності",
+          rj.classify("Учасник не виправив виявлені замовником невідповідності")
+          == "Не усунув невідповідності")
+    check("аномально низька ціна",
+          rj.classify("Учасник не надав обґрунтування аномально низької ціни")
+          == "Аномально низька ціна")
+    check("кваліфікаційні критерії",
+          rj.classify("Учасник не відповідає кваліфікаційним критеріям, установленим "
+                      "статтею 16 Закону") == "Не відповідає кваліфікаційним критеріям")
+    check("строк дії пропозиції",
+          rj.classify("Тендерна пропозиція є такою, строк дії якої закінчився")
+          == "Строк дії пропозиції минув")
+    # «Не надав забезпечення» починається тим самим «не надав», що й «не надав
+    # документи», а слово «документація» стоїть поруч — без застереження в
+    # шаблоні перемагала б чужа категорія.
+    check("забезпечення не плутається з документами",
+          rj.classify("Переможець не надав забезпечення виконання договору у формі, "
+                      "визначеній тендерною документацією") == "Не надав забезпечення")
+
+    # Замовники зчіплюють підстави в один рядок — вирішує позиція, а не
+    # порядок категорій у довіднику.
+    check("перемагає перша названа підстава",
+          rj.classify("не відповідає умовам технічної специфікації; не відповідає "
+                      "вимогам, установленим у тендерній документації")
+          == "Невідповідність технічним вимогам")
+    check("підстава важливіша за переказ обставин",
+          rj.classify("Тендерна пропозиція не відповідає умовам технічної специфікації",
+                      "Учасник згодом відмовився від укладення договору")
+          == "Невідповідність технічним вимогам")
+    check("без підстави читаємо пояснення",
+          rj.classify("", "Переможець письмово відмовився від укладення договору")
+          == "Відмова від договору")
+    check("немає тексту — немає причини", rj.classify("", "") == rj.UNSTATED)
+    check("незнайоме формулювання не вигадується",
+          rj.classify("Рішення уповноваженої особи №17") == rj.OTHER)
+
+    check("ознаки документів",
+          rj.marks("не надав сертифікат", "відсутній лист виробника")
+          == ["сертифікат", "авторизаційний лист"])
+    check("без тексту ознак немає", rj.marks("", "") == [])
+    check("підстава відміни з переліку",
+          rj.cancel_label("noDemand") == "Відсутня потреба в закупівлі")
+    check("невідомий код підстави лишається як є",
+          rj.cancel_label("newReason") == "newReason")
+    # Скасоване рішення — це та сама подія вдруге (51 із 55 у вибірці мали
+    # `unsuccessful`-двійника), тож відмовою вважаємо лише відхилення.
+    check("відмова — це лише unsuccessful",
+          (rj.is_rejected("unsuccessful"), rj.is_rejected("cancelled"),
+           rj.is_rejected("active")) == (True, False, False))
+
+
+def test_rejection_extract(tmp: Path) -> None:
+    print("\n=== причини відмов: розбір картки й запис у базу ===")
+    tender = {
+        "id": "u1", "tenderID": "UA-2026-05-01-000001-a",
+        "awards": [
+            {"id": "aw1", "status": "unsuccessful", "date": "2026-05-10",
+             "value": {"amount": 100.0, "currency": "UAH"},
+             "title": "Переможець письмово відмовився від укладення договору",
+             "description": "Лист-відмова б/н", "qualified": False,
+             "suppliers": [{"name": "ТОВ Один",
+                            "identifier": {"scheme": "UA-EDR", "id": "12345678"}}]},
+            {"id": "aw2", "status": "active", "date": "2026-05-12",
+             "value": {"amount": 120.0, "currency": "UAH"},
+             "title": "Визнаний переможцем", "qualified": True, "eligible": True,
+             "suppliers": [{"name": "ТОВ Два",
+                            "identifier": {"scheme": "UA-EDR", "id": "87654321"}}]},
+        ],
+        "cancellations": [
+            {"id": "c1", "status": "active", "reasonType": "noDemand",
+             "reason": "Потреба відпала", "date": "2026-05-20"},
+        ],
+    }
+    parsed = parse_tender(tender)
+    first, second = parsed["awards"]
+    check("підставу знято з картки", first[9].startswith("Переможець письмово"), first[9])
+    check("пояснення знято з картки", first[10] == "Лист-відмова б/н", first[10])
+    check("qualified — 0, а не порожньо", first[11] == 0, first[11])
+    # `eligible` приходить не завжди (виміряно: 18 зі 106 нечинних рішень),
+    # і нуль замість «невідомо» читався б як «не відповідає критеріям».
+    check("відсутнє eligible лишається невідомим", first[12] is None, first[12])
+    check("у чинному рішенні title — не причина", second[9] == "Визнаний переможцем")
+    # Конвеєр бере ЄДРПОУ переможця з дев'ятого поля; нові колонки дописані в
+    # кінець саме тому.
+    check("ЄДРПОУ переможця лишився восьмим", first[8] == "12345678", first[8])
+    check("відміну закупівлі розібрано",
+          parsed["cancellations"] == [("c1", "u1", "active", "noDemand",
+                                       "Потреба відпала", None, "2026-05-20")],
+          parsed["cancellations"])
+
+    db = Database(tmp / "відмови.db")
+    db.save_tender(parsed["row"], lots=[], items=[], bids=[], awards=parsed["awards"],
+                   contracts=[], docs=[], cancellations=parsed["cancellations"])
+    rows = {r["id"]: dict(r) for r in db.query("SELECT * FROM awards")}
+    check("причина збереглася", rows["aw1"]["reason"].startswith("Переможець"))
+    check("відміна збереглася",
+          db.scalar("SELECT reason_type FROM cancellations") == "noDemand")
+    # Типове очищення прибирає зібране, але не індекс: відміни — зібране.
+    db.reset_collected()
+    check("відміни прибираються разом зі збором",
+          db.scalar("SELECT COUNT(*) FROM cancellations") == 0)
+    db.close()
+
+    # База, зібрана попередньою версією: колонок причин у ній ще немає, і
+    # `CREATE TABLE IF NOT EXISTS` їх не додасть.
+    import sqlite3
+    old = tmp / "стара.db"
+    conn = sqlite3.connect(old)
+    conn.execute("CREATE TABLE awards (id TEXT PRIMARY KEY, tender_uuid TEXT NOT NULL,"
+                 " lot_id TEXT, status TEXT, date TEXT, value_amount REAL, currency TEXT,"
+                 " supplier_name TEXT, supplier_edrpou TEXT)")
+    conn.commit()
+    conn.close()
+    upgraded = Database(old)
+    columns = {r[1] for r in upgraded.query("PRAGMA table_info(awards)")}
+    check("стару базу дописано без втрат",
+          {"reason", "explanation", "qualified", "eligible"} <= columns, sorted(columns))
+    upgraded.close()
+
+
+def test_rejection_export(tmp: Path) -> None:
+    print("\n=== причини відмов: книга даних ===")
+    from app.core import rawexport
+    from app.core.xlsxload import TABLES, _match_columns
+
+    db = Database(tmp / "вивантаження-відмов.db")
+    row = {"uuid": "u1", "tender_id": "UA-1", "title": "Ноутбуки", "description": "",
+           "status": "complete", "method_type": "aboveThreshold", "main_category": "goods",
+           "date_created": "2026-05-01T10:00:00+03:00", "date_modified": "", "tender_start": "",
+           "tender_end": "", "value_amount": 100.0, "value_currency": "UAH", "vat_included": 1,
+           "pe_name": "Замовник", "pe_edrpou": "04527520", "pe_region": "Київська область",
+           "pe_locality": "Київ", "n_lots": 0, "n_bids": 1, "n_docs": 0,
+           "cpv_list": "30213100-6", "fetched_at": ""}
+    db.save_tender(
+        row, lots=[], items=[], bids=[], contracts=[], docs=[],
+        awards=[("aw1", "u1", None, "unsuccessful", "2026-05-10", 100.0, "UAH",
+                 "ТОВ Один", "12345678",
+                 "Переможець письмово відмовився від укладення договору", "", 0, None),
+                ("aw2", "u1", None, "active", "2026-05-12", 120.0, "UAH",
+                 "ТОВ Два", "87654321", "Визнаний переможцем", "", 1, 1)],
+        cancellations=[("c1", "u1", "active", "noDemand", "Потреба відпала", None,
+                        "2026-05-20")])
+
+    headers, rows = rawexport.awards(db)
+    by_id = {r[3]: r for r in rows}
+    check("категорія порахована при вивантаженні",
+          by_id["12345678"][9] == "Відмова від договору", by_id["12345678"][9])
+    # «Визнаний переможцем» — не причина; лишити його в колонці причин
+    # означало б, що кожен другий переможець «відхилений».
+    check("у чинного рішення причини немає",
+          (by_id["87654321"][8], by_id["87654321"][9]) == ("", ""), by_id["87654321"])
+
+    cancel_headers, cancel_rows = rawexport.cancellations(db)
+    check("підстава відміни підписана людською мовою",
+          cancel_rows[0][7] == "Відсутня потреба в закупівлі", cancel_rows[0])
+
+    # Книгу читає аналітика, і зіставляє вона за назвами колонок — тож обидва
+    # боки мають зійтися без окремої домовленості.
+    found = _match_columns(list(headers), TABLES["awards"]["columns"])
+    check("аналітика знаходить причину в книзі",
+          {"reason", "explanation"} <= set(found), sorted(found))
+    found_cancel = _match_columns(list(cancel_headers), TABLES["cancellations"]["columns"])
+    check("аналітика знаходить відміни в книзі",
+          set(TABLES["cancellations"]["columns"]) == set(found_cancel), sorted(found_cancel))
+
+    # Те саме зведення, що й за кнопкою «Зведення»: воно рахується з бази, а не
+    # з книги, тож причини мають зійтися по обох шляхах.
+    from app.core import analytics
+    sheets = analytics.build_sheets(db)
+    reasons = sheets["Причини відмов"][1]
+    check("причини у зведенні", reasons[0][:2] == ["Відмова від договору", 1], reasons)
+    players = sheets["Скасовані перемоги"][1]
+    check("зірвана перемога в зведенні",
+          players[0][:3] == ["12345678", "ТОВ Один", 1], players)
+    db.close()
+
+
+def _rejection_dataset(tmp: Path):
+    """Вибірка, у якій перемоги зриваються всіма відомими способами."""
+    from app.core.xlsxload import Dataset
+
+    OURS, RIVAL = "41263186", "12345678"
+
+    def tender(number: int):
+        return {"tender_id": f"UA-{number}", "date": "2026-05-01", "title": "Ноутбуки",
+                "description": "", "cpv_list": "30213100-6", "status": "Завершена",
+                "method": "Відкриті торги", "category": "goods", "value": 150000.0,
+                "currency": "UAH", "vat": "так", "buyer": f"Замовник {number}",
+                "buyer_edrpou": f"0452752{number}", "region": "Київська область",
+                "locality": "Київ", "n_lots": 0, "n_bids": 2, "n_docs": 0,
+                "tender_start": "", "tender_end": "", "modified": "", "url": ""}
+
+    def bid(number, edrpou, amount):
+        return {"tender_id": f"UA-{number}", "date": "2026-05-01", "name": f"ТОВ {edrpou}",
+                "edrpou": edrpou, "region": "Київська область", "amount": amount,
+                "currency": "UAH", "status": "active", "submitted": "2026-05-02"}
+
+    def award(number, edrpou, status, amount, reason="", explanation=""):
+        return {"tender_id": f"UA-{number}", "date": "2026-05-01", "name": f"ТОВ {edrpou}",
+                "edrpou": edrpou, "amount": amount, "currency": "UAH", "status": status,
+                "decided": "2026-05-10", "reason": reason, "explanation": explanation}
+
+    def contract(number, edrpou, amount):
+        return {"tender_id": f"UA-{number}", "contract_id": f"UA-{number}-a1",
+                "name": f"ТОВ {edrpou}", "edrpou": edrpou, "amount": amount,
+                "currency": "UAH", "status": "active", "signed": "2026-05-10",
+                "buyer": f"Замовник {number}", "buyer_edrpou": f"0452752{number}",
+                "region": "Київська область", "cpv_list": "30213100-6"}
+
+    return Dataset(
+        path=tmp / "відмови.xlsx",
+        tenders=[tender(i) for i in range(1, 5)],
+        bids=[bid(1, RIVAL, 100000.0),
+              bid(2, OURS, 90000.0), bid(2, RIVAL, 100000.0),
+              bid(3, RIVAL, 100000.0), bid(4, RIVAL, 100000.0)],
+        awards=[
+            award(1, RIVAL, "active", 100000.0),
+            # Нас відхилили за технікою, і закупівля пішла до конкурента.
+            award(2, OURS, "unsuccessful", 90000.0,
+                  "Тендерна пропозиція учасника не відповідає умовам технічної специфікації"),
+            award(2, RIVAL, "active", 100000.0),
+            # Одна подія двома рядками: спершу скасоване рішення, потім відхилення.
+            award(3, RIVAL, "cancelled", 100000.0, "Визнаний переможцем"),
+            award(3, RIVAL, "unsuccessful", 100000.0,
+                  "Переможець письмово відмовився від укладення договору"),
+            # Замовник обмежився зміною статусу.
+            award(4, RIVAL, "unsuccessful", 100000.0),
+        ],
+        contracts=[contract(1, RIVAL, 100000.0), contract(2, RIVAL, 100000.0)],
+        cancellations=[{"tender_id": "UA-4", "date": "2026-05-01", "buyer": "Замовник 4",
+                        "buyer_edrpou": "04527524", "value": 150000.0,
+                        "cancelled": "2026-05-20", "status": "active",
+                        "reason": "Відсутня потреба в закупівлі",
+                        "explanation": "Потреба відпала"}],
+    ), OURS, RIVAL
+
+
+def test_rejection_section(tmp: Path) -> None:
+    print("\n=== причини відмов: розділ звіту ===")
+    from app.core import insight
+
+    data, ours, rival = _rejection_dataset(tmp)
+    report = insight.analyse(data, own_edrpou=[ours])
+    check("розділ «Відмови» стоїть після прогнозу",
+          list(report.sections).index("Відмови") == list(report.sections).index("Ринок") + 2,
+          list(report.sections))
+    block = report.sections["Відмови"][0]
+    tiles = dict(block.tiles)
+    # Скасоване рішення в UA-3 — двійник відхилення, і рахувати його окремо
+    # означало б чотири відмови замість трьох.
+    check("скасоване рішення не рахується вдруге",
+          tiles["Скасовано перемог"] == "3", tiles)
+    # Знаменник — ухвалені рішення: два чинних і три відхилення.
+    check("частка від ухвалених рішень", tiles["Частка рішень"] == "60,0%", tiles)
+    check("сума скасованих перемог", tiles["Сума скасованих перемог"].startswith("290"), tiles)
+    check("закупівель зачепило три", tiles["Закупівель зачепило"] == "3", tiles)
+    check("наші втрати видно окремо",
+          tiles["Наших перемог зірвано"].startswith("1 на 90"), tiles)
+
+    reasons = {row[0]: row[1] for row in dict(block.tables)["Причини"][1]}
+    check("причини розкладено", reasons == {"Відмова від договору": 1,
+                                            "Невідповідність технічним вимогам": 1,
+                                            "Причину не зазначено": 1}, reasons)
+    firms = {row[0]: row for row in dict(block.tables)["Компанії"][1]}
+    check("у конкурента дві зірвані перемоги", firms[rival][2] == 2, firms[rival])
+    check("частка зривів рахується від його ж перемог",
+          firms[rival][4] == 0.5, firms[rival])
+    check("наша компанія позначена", firms[ours][7] == "так", firms[ours])
+    cases = dict(block.tables)["Випадки"][1]
+    check("у переліку випадків три рядки", len(cases) == 3, len(cases))
+
+    notes = " ".join(block.notes)
+    check("порожню підставу названо прямо", "У 1 випадку з 3" in notes, notes)
+    # Число у висновок підставляється з даних, тож форма іменника має
+    # узгоджуватися сама: «зачепило 1 разів» вилізло б на першій же вибірці.
+    check("число узгоджене з іменником", "зачепило 1 раз на" in notes, notes)
+
+    cancelled = report.sections["Відмови"][1]
+    check("відмінені закупівлі окремим блоком",
+          cancelled.title == "Відмінені закупівлі", cancelled.title)
+    check("підстава відміни в таблиці",
+          dict(cancelled.tables)["Підстави"][1][0][0] == "Відсутня потреба в закупівлі",
+          dict(cancelled.tables)["Підстави"][1])
+
+    # Вкладка будується під час першого показу — саме там ловляться помилки в
+    # кресленні нових діаграм.
+    from PySide6.QtGui import QPixmap
+    from PySide6.QtWidgets import QApplication
+
+    from app.config import Settings
+    from app.ui.pages.analytics_page import AnalyticsPage
+
+    QApplication.instance() or QApplication([])
+    page = AnalyticsPage(Settings())
+    page.resize(1200, 800)
+    page.report = report
+    page.show_report(report)
+    page.tabs.setCurrentIndex([page.tabs.tabText(i) for i in range(page.tabs.count())]
+                              .index("Відмови"))
+    page.render(QPixmap(page.size()))
+    check("вкладка «Відмови» малюється", True)
+
+
+def test_rejection_in_profiles(tmp: Path) -> None:
+    print("\n=== причини відмов: портрети й очні зустрічі ===")
+    from app.core import insight
+
+    data, ours, rival = _rejection_dataset(tmp)
+    report = insight.analyse(data, own_edrpou=[ours])
+
+    profile = next(p for p in report.competitors if p.edrpou == rival)
+    check("зірвані перемоги в портреті", profile.n_rejected == 2, profile.n_rejected)
+    check("головна причина названа",
+          profile.reject_reason in ("Відмова від договору", "Причину не зазначено"),
+          profile.reject_reason)
+    tiles = dict(profile.block.tiles)
+    check("плитка зривів", tiles["Зірвано перемог"].startswith("2 на 200"), tiles)
+    check("таблиця зірваних перемог є",
+          len(dict(profile.block.tables)["Зірвані перемоги"][1]) == 2)
+
+    # Головне: там, де ціна була наша, а закупівля пішла не до нас, більше не
+    # доводиться здогадуватись — підставу назвав сам замовник.
+    verdicts = {row[0]: row[7] for row in dict(profile.block.tables)["Наші зустрічі"][1]}
+    check("причину програшу взято з картки",
+          verdicts.get("UA-2") == "нас відхилили: невідповідність технічним вимогам",
+          verdicts)
+
+    mine = next(p for p in report.ours if p.edrpou == ours)
+    check("наша зірвана перемога порахована", mine.n_rejected == 1, mine.n_rejected)
+    summary = " ".join(report.sections["Підсумок"][0].notes)
+    check("у підсумку сказано, скільки перемог втрачено після відхилення",
+          "втратили після відхилення" in summary, summary)
+
+
+def test_rejection_double_count(tmp: Path) -> None:
+    print("\n=== причини відмов: сума рішень — не сума грошей ринку ===")
+    from app.core import insight
+    from app.core.rejections import DETAIL_ROWS
+    from app.core.xlsxload import Dataset
+
+    def tender(number: int):
+        return {"tender_id": f"UA-{number}", "date": "2026-05-01", "title": "Ноутбуки",
+                "description": "", "cpv_list": "30213100-6", "status": "Завершена",
+                "method": "Відкриті торги", "category": "goods", "value": 150000.0,
+                "currency": "UAH", "vat": "так", "buyer": "Замовник",
+                "buyer_edrpou": "04527520", "region": "Київська область",
+                "locality": "Київ", "n_lots": 0, "n_bids": 2, "n_docs": 0,
+                "tender_start": "", "tender_end": "", "modified": "", "url": ""}
+
+    def award(number, edrpou, status, amount, reason=""):
+        return {"tender_id": f"UA-{number}", "date": "2026-05-01", "name": f"ТОВ {edrpou}",
+                "edrpou": edrpou, "amount": amount, "currency": "UAH", "status": status,
+                "decided": "2026-05-10", "reason": reason, "explanation": ""}
+
+    # Одна закупівля, у якій замовник поспіль відхилив двох переможців, і
+    # договір урешті підписав третій. Грошей ринок не втратив — але скасованих
+    # рішень тут два, і сума їх обох до ринку не додається.
+    refusal = "Переможець письмово відмовився від укладення договору"
+    data = Dataset(
+        path=tmp / "подвійний-рахунок.xlsx",
+        tenders=[tender(1)],
+        awards=[award(1, "11111111", "unsuccessful", 100000.0, refusal),
+                award(1, "22222222", "unsuccessful", 110000.0, refusal),
+                award(1, "33333333", "active", 120000.0)],
+        contracts=[{"tender_id": "UA-1", "contract_id": "UA-1-a1", "name": "ТОВ 33333333",
+                    "edrpou": "33333333", "amount": 120000.0, "currency": "UAH",
+                    "status": "active", "signed": "2026-05-12", "buyer": "Замовник",
+                    "buyer_edrpou": "04527520", "region": "Київська область",
+                    "cpv_list": "30213100-6"}],
+    )
+    block = insight.analyse(data).sections["Відмови"][0]
+    tiles = dict(block.tiles)
+    check("скасованих перемог дві", tiles["Скасовано перемог"] == "2", tiles)
+    check("а закупівля одна", tiles["Закупівель зачепило"] == "1", tiles)
+    check("сума — це сума рішень",
+          tiles["Сума скасованих перемог"].startswith("210"), tiles)
+    notes = " ".join(block.notes)
+    check("про повторний рахунок сказано прямо",
+          "враховані кілька разів" in notes and "не грошей, що зникли з ринку" in notes,
+          notes)
+    check("число узгоджене й тут", "У 1 закупівлі поспіль" in notes
+          and "у 1 закупівлі на" in notes, notes)
+
+    # Довгий перелік випадків обрізається — і про це теж треба сказати, бо
+    # інакше «300 з 300» у таблиці читається як «оце всі відмови».
+    many = Dataset(
+        path=tmp / "багато-відмов.xlsx",
+        tenders=[tender(i) for i in range(1, DETAIL_ROWS + 2)],
+        awards=[award(i, f"{i:08d}", "unsuccessful", 1000.0 + i, refusal)
+                for i in range(1, DETAIL_ROWS + 2)],
+    )
+    long_block = insight.analyse(many).sections["Відмови"][0]
+    cases = dict(long_block.tables)["Випадки"][1]
+    check("перелік обрізано до межі", len(cases) == DETAIL_ROWS, len(cases))
+    check("про обрізання сказано",
+          any("Повний перелік" in note for note in long_block.notes), long_block.notes)
+
+
+def test_excel_serial_time() -> None:
+    print("\n=== порядковий номер Excel → дата ===")
+    from app.core.xlsxfast import _from_serial
+
+    # 0,572916666… доби — це рівно 13:45. У подвійній точності
+    # timedelta(days=...) давав 13:44:59,999999, і час у книзі читався б на
+    # секунду раніше, ніж його показує Excel.
+    check("час без похибки", _from_serial(46143.572916666664).isoformat()
+          == "2026-05-01T13:45:00", _from_serial(46143.572916666664).isoformat())
+    check("ціла доба — опівніч", _from_serial(46143).isoformat() == "2026-05-01T00:00:00")
+    check("північ наступного дня не з'їдається",
+          _from_serial(46143.99999999).date().isoformat() == "2026-05-01")
+    check("сміття не падає", _from_serial(1e12) == 1e12)
+
+
+def test_progress_scale(tmp: Path) -> None:
+    print("\n=== спільна шкала поступу: читання + аналіз ===")
+    from app.core import insight, xlsxload
+
+    # Сторінка аналітики склеює дві смуги в одну, зсуваючи аналіз на кількість
+    # аркушів книги. Числа мусять збігатися з тим, що модулі справді роблять:
+    # доданий аркуш або новий крок інакше зсувають відсоток, і смуга стрибає.
+    steps: list[tuple[int, int]] = []
+    insight.analyse(xlsxload.Dataset(path=tmp / "порожньо.xlsx"),
+                    on_progress=lambda stage, done, total: steps.append((done, total)))
+    check("аналіз оголошує стільки кроків, скільки в константі",
+          {total for _done, total in steps} == {insight.ANALYSIS_STEPS},
+          {total for _done, total in steps})
+    check("останній крок доходить до кінця шкали",
+          max(done for done, _total in steps) == insight.ANALYSIS_STEPS,
+          max(done for done, _total in steps))
+    check("кроки не повторюються й не задкують",
+          [d for d, _t in steps] == sorted(set(d for d, _t in steps)),
+          [d for d, _t in steps])
+
+    read: list[tuple[int, int]] = []
+    xlsxload.load(_empty_book(tmp), lambda stage, done, total: read.append((done, total)))
+    check("читання оголошує стільки кроків, скільки логічних таблиць",
+          {total for _done, total in read} == {len(xlsxload.TABLES)},
+          {total for _done, total in read})
+
+
+def _empty_book(tmp: Path) -> Path:
+    from openpyxl import Workbook
+
+    path = tmp / "шкала.xlsx"
+    book = Workbook()
+    book.active.title = "Закупівлі"
+    book.active.append(["Номер закупівлі", "Дата оприлюднення"])
+    book.save(path)
+    return path
+
+
+def test_impossible_dates(tmp: Path) -> None:
+    print("\n=== неможлива дата не валить аналіз ===")
+    from app.core import insight
+    from app.core.xlsxload import Dataset, as_date
+
+    # Раніше досить було, щоб дефіси стояли на своїх місцях: «2026-13-45»
+    # проходило як дата, а прогноз робив із неї справжній ``date`` — і весь
+    # аналіз падав із ValueError: month must be in 1..12.
+    check("неможливий місяць відкидається", as_date("2026-13-45") == "", as_date("2026-13-45"))
+    check("неможливий день відкидається", as_date("2026-02-30") == "")
+    check("29 лютого високосного року — дата", as_date("29.02.2024") == "2024-02-29")
+    check("29 лютого звичайного — ні", as_date("29.02.2026") == "")
+    check("сміття з цифр не стає датою", as_date("45.99.2026") == "")
+    check("звичайна дата не постраждала", as_date("2026-05-01T10:00:00+03:00") == "2026-05-01")
+    check("місяць лише з можливої дати", insight.month_of("2026-05-01") == "2026-05")
+    check("з неможливої — порожньо", insight.month_of("2026-13-01") == "")
+
+    def tender(number: int, day: str):
+        return {"tender_id": f"UA-{number}", "date": day, "title": "Ноутбуки",
+                "description": "", "cpv_list": "30213100-6", "status": "Завершена",
+                "method": "Відкриті торги", "category": "goods", "value": 150000.0,
+                "currency": "UAH", "vat": "так", "buyer": "Замовник",
+                "buyer_edrpou": "04527520", "region": "Київська область",
+                "locality": "Київ", "n_lots": 0, "n_bids": 1, "n_docs": 0,
+                "tender_start": "", "tender_end": "", "modified": "", "url": ""}
+
+    def contract(number: int, day: str):
+        return {"tender_id": f"UA-{number}", "contract_id": f"UA-{number}-a1",
+                "name": "ТОВ", "edrpou": "12345678", "amount": 100000.0,
+                "currency": "UAH", "status": "active", "signed": day,
+                "buyer": "Замовник", "buyer_edrpou": "04527520",
+                "region": "Київська область", "cpv_list": "30213100-6"}
+
+    days = ["2026-03-01", "2026-04-01", "2026-05-01", "2026-06-01", "2026-07-01",
+            "2026-13-45"]
+    data = Dataset(path=tmp / "зіпсована-дата.xlsx",
+                   tenders=[tender(i, d) for i, d in enumerate(days, 1)],
+                   contracts=[contract(i, d) for i, d in enumerate(days, 1)])
+    report = insight.analyse(data)
+    check("аналіз доходить до кінця", len(report.sections) >= 8, list(report.sections))
+    check("прогноз усе одно є", "Прогнозування" in report.sections, list(report.sections))
+
+
+def test_visibility_matches_deals(tmp: Path) -> None:
+    print("\n=== крива видимості = правило угод ===")
+    from datetime import date as _date
+
+    from app.core.outlook import OutlookMixin
+
+    published = _date(2026, 5, 1)
+    award_one = (_date(2026, 5, 10), 100.0)
+    award_two = (_date(2026, 5, 25), 50.0)
+    deal = (_date(2026, 5, 20), 90.0)
+
+    def visible(steps, age):
+        return round(sum(delta for lag, delta in steps if lag <= age), 2)
+
+    # Доки договору немає, гроші закупівлі — це рішення про переможця.
+    only_awards = OutlookMixin._visibility(published, (), [award_one])
+    # 10 травня — це дев'ятий день від оприлюднення 1 травня.
+    check("до договору видно рішення", visible(only_awards, 8) == 0.0
+          and visible(only_awards, 9) == 100.0, only_awards)
+
+    # Щойно виходить договір, рішення перестають рахуватися — і ті, що
+    # з'явилися пізніше, теж: ``_deals`` дивиться на факт договору, а не на
+    # дати. Багатолотова закупівля (лот 1 з договором, лот 2 ще з рішенням)
+    # інакше показувала б у кривій більше грошей, ніж бачить сам аналіз.
+    mixed = OutlookMixin._visibility(published, [deal], [award_one, award_two])
+    check("до договору — рішення", visible(mixed, 15) == 100.0, mixed)
+    check("після договору — лише договір", visible(mixed, 19) == 90.0, mixed)
+    check("пізніше рішення не додається", visible(mixed, 40) == 90.0, mixed)
+
+
+def test_chart_edges() -> None:
+    print("\n=== діаграми на вироджених даних ===")
+    from PySide6.QtGui import QPixmap
+    from PySide6.QtWidgets import QApplication
+
+    from app.core.report import ChartData, Series
+    from app.ui.widgets.charts import build
+
+    QApplication.instance() or QApplication([])
+    # `None` у ряду — це «даних немає» (див. Series), і лінія його вміла
+    # завжди, а стовпчики, смуги й кільце падали ще на пошуку максимуму.
+    # Нескінченність приходить не з рушія, а з книги: float("1e400") — це вже
+    # inf, і Qt кидав на ньому OverflowError просто з paintEvent.
+    cases = {
+        "порожній ряд": [Series("Ряд", [], [])],
+        "без рядів": [],
+        "усі нулі": [Series("Ряд", ["A", "B"], [0.0, 0.0])],
+        "від'ємні": [Series("Ряд", ["A", "B"], [-10.0, -20.0])],
+        "розрив усередині": [Series("Ряд", ["A", "B", "C"], [1.0, None, 3.0])],
+        "самі розриви": [Series("Ряд", ["A", "B"], [None, None])],
+        "нескінченність": [Series("Ряд", ["A", "B"], [float("inf"), 1.0])],
+        "NaN": [Series("Ряд", ["A", "B"], [float("nan"), 1.0])],
+        "значень менше за мітки": [Series("Ряд", ["A", "B", "C"], [1.0])],
+        "виділення поза межами": [Series("Ряд", ["A"], [1.0], accent={9})],
+    }
+    failed: list[str] = []
+    for name, series in cases.items():
+        for kind in ("bar", "hbar", "pie", "line", "area", "hist", "scatter"):
+            try:
+                view = build(ChartData(name, kind, series, unit="грн"), "dark")
+                view.resize(400, 240)
+                view.render(QPixmap(view.size()))
+            except Exception as exc:
+                failed.append(f"{kind}/{name}: {type(exc).__name__}")
+    check("жодна діаграма не падає", not failed, failed[:5])
+
+    # Розрив не має ставати нулем: лінія прогнозу саме на цьому й тримається.
+    line = build(ChartData("розрив", "line",
+                           [Series("Ряд", ["A", "B", "C"], [10.0, None, 30.0])]), "dark")
+    line.resize(400, 240)
+    line.render(QPixmap(line.size()))
+    check("точок стільки, скільки відомих значень", len(line._hits) == 2, len(line._hits))
+
+
 def main() -> int:
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     with tempfile.TemporaryDirectory(prefix="prozorro-test-") as raw:
@@ -2389,11 +4232,17 @@ def main() -> int:
         test_batch_files()
         test_market()
         test_market_api()
+        test_gone_cards(tmp)
+        test_product_groups()
+        test_two_product_tables(tmp)
         test_search_quota()
         test_search_plan(tmp)
+        test_unnamed_procedure(tmp)
+        test_buyer_split(tmp)
         test_search_progress(tmp)
         test_host_policies()
         test_output_dir(tmp)
+        test_output_dir_inside_project(tmp)
         test_one_date()
         test_resolve_choice(tmp)
         test_summary_resolver(tmp)
@@ -2405,6 +4254,7 @@ def main() -> int:
         test_brands()
         test_xlsxload(tmp)
         test_insight(tmp)
+        test_ours_never_hidden(tmp)
         test_fast_reader(tmp)
         test_workbook_listing(tmp)
         test_tracked_competitors(tmp)
@@ -2414,10 +4264,25 @@ def main() -> int:
         test_reader_fallback(tmp)
         test_deal_sources(tmp)
         test_cancel_midway(tmp)
-        test_export_names()
+        test_export_names(tmp)
+        test_report_overview(tmp)
+        test_report_book(tmp)
+        test_profile_book(tmp)
+        test_profile_export_button(tmp)
         test_number_formats()
         test_loss_reasons(tmp)
         test_head_to_head(tmp)
+        test_rejection_reasons()
+        test_rejection_extract(tmp)
+        test_rejection_export(tmp)
+        test_rejection_section(tmp)
+        test_rejection_in_profiles(tmp)
+        test_rejection_double_count(tmp)
+        test_excel_serial_time()
+        test_progress_scale(tmp)
+        test_impossible_dates(tmp)
+        test_visibility_matches_deals(tmp)
+        test_chart_edges()
         test_column_matching()
         test_settings_robustness(tmp)
         test_own_tm_verdict(tmp)
@@ -2431,6 +4296,10 @@ def main() -> int:
         test_analytics_is_file_only(tmp)
         test_scale(tmp)
         test_charts()
+        test_forecast_models()
+        test_forecast_choice_risk()
+        test_forecast_seasonality()
+        test_forecast_completeness(tmp)
     if FAILED:
         print(f"\nНЕ ПРОЙШЛО {len(FAILED)}: {', '.join(FAILED)}")
         return 1

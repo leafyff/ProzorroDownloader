@@ -114,8 +114,13 @@ class CountWorker(QThread):
                 on_stats=lambda s: self.bridge.stats.emit(s),
                 cancel_event=self.cancel_event,
             )
-            cards = pipeline.discover()
-            pipeline.client.close()
+            try:
+                cards = pipeline.discover()
+            finally:
+                # Клієнт тримає пул з'єднань, і закрити його треба навіть тоді,
+                # коли пошук обірвався: інакше кожна невдала спроба лишає по
+                # собі відкриті сокети.
+                pipeline.client.close()
         except Cancelled:
             self.bridge.log.emit("warn", "Підрахунок зупинено.")
         except Exception as exc:
@@ -236,12 +241,13 @@ class AnalysisWorker(QThread):
     """
 
     def __init__(self, path: Path, settings: Settings, drop_outliers: bool = True,
-                 top_competitors: int = 20, parent=None):
+                 top_competitors: int = 20, horizon: int = 3, parent=None):
         super().__init__(parent)
         self.path = Path(path)
         self.settings = settings
         self.drop_outliers = drop_outliers
         self.top_competitors = top_competitors
+        self.horizon = horizon
         self.cancel_event = threading.Event()
         self.bridge = _Bridge()
 
@@ -263,20 +269,24 @@ class AnalysisWorker(QThread):
     def run(self) -> None:
         report = None
         error = ""
+        # Читання й аналіз — два етапи одного поступу на спільній шкалі:
+        # спершу аркуші книги, далі кроки аналізу. Числа беремо з самих
+        # модулів, бо доданий аркуш чи новий крок інакше зсунули б відсоток.
+        tables = len(xlsxload.TABLES)
         try:
-            # Читання й аналіз — два етапи одного поступу, тож зсуваємо
-            # лічильник читання в перші кроки спільної шкали.
             data = xlsxload.load(
                 self.path,
-                lambda stage, done, total: self.bridge.progress.emit(stage, done, total + 8))
+                lambda stage, done, total:
+                    self.bridge.progress.emit(stage, done, total + insight.ANALYSIS_STEPS))
             report = insight.analyse(
                 data,
                 own_edrpou=self.settings.own_edrpou,
                 tracked=self.settings.competitors,
                 drop_outliers=self.drop_outliers,
                 top_competitors=self.top_competitors,
+                horizon=self.horizon,
                 on_progress=lambda stage, done, total:
-                    self.bridge.progress.emit(stage, done + 9, total + 9),
+                    self.bridge.progress.emit(stage, done + tables, total + tables),
                 cancel_event=self.cancel_event)
         except insight.Cancelled:
             self.bridge.log.emit("warn", "Аналіз зупинено.")

@@ -38,6 +38,11 @@ PROC_TYPE_MAX_LEN = 30
 #: Скільки поспіль «застарих» сторінок терпимо, перш ніж зупинити гортання.
 STALE_PAGE_TOLERANCE = 3
 
+#: Скільки невдалих карток каталогу називаємо поштучно. Далі — лише підсумок:
+#: журнал на дві тисячі однакових рядків не читає ніхто, а перші кілька
+#: показують, що саме сталося.
+MARKET_WARN_LIMIT = 5
+
 #: На скільки днів гортаємо глибше за початок періоду.
 #:
 #: Відколи відбір, зупинка й упорядкування видачі спираються на одну дату
@@ -100,6 +105,10 @@ class Pipeline:
                                  on_log=self._log)
         self.result = JobResult()
         self._lock = threading.Lock()
+        #: Процедури, які довелося пропустити в розрізі за процедурою, бо
+        #: пошук не приймає їхніх назв. Наповнює крок пошуку, читає
+        #: :meth:`pickup_unnamed`.
+        self.unnamed_methods: set[str] = set()
         self._codes_cache: list[str] | None = None
         self._codes_set: set[str] = set()
         self._status_set = set(preset.statuses or [])
@@ -235,6 +244,56 @@ class Pipeline:
         self._tick()
         return mapping
 
+    def pickup_unnamed(self, known: dict[str, str]) -> dict[str, str]:
+        """Добирає з індексу закупівлі процедур, яких пошук не вміє назвати.
+
+        Пошук порталу відхиляє значення ``proc_type`` довші за 30 символів
+        (``The proc_type.0 may not be greater than 30 characters``), а
+        ``closeFrameworkAgreementSelectionUA`` має 34 — тож «Відбір за рамковою
+        угодою» через пошук недосяжний, і розріз за процедурою його губить.
+
+        Зате він є у стрічці змін ЦБД, з якої будується індекс: там уже лежать
+        і номер, і UUID, і тип процедури. Беремо звідти всі такі закупівлі
+        періоду — їх у стрічці 0,05%, тобто сотні на рік, — а відсіє їх далі
+        той самий :meth:`_passes_filters`, що й решту: за ДК021, датою,
+        регіоном. Дешевше, ніж здається: коди ДК021 стрічка не віддає, тому
+        іншого способу, ніж узяти картки й подивитися, немає.
+        """
+        methods = sorted(self.unnamed_methods)
+        if not methods:
+            return {}
+        names = ", ".join(f"«{METHOD_LABELS.get(m, m)}»" for m in methods)
+        blocked = (f"Процедуру {names} пошук назвати не може (назва довша за "
+                   f"{PROC_TYPE_MAX_LEN} символів), тому вона добирається з індексу.")
+        if not self.s.keep_full_index:
+            # З неповним індексом добирати нема звідки: у ньому лежить лише те,
+            # що знайшов пошук, а саме цих закупівель він і не знаходить.
+            self._log("warn", f"{blocked} Але індекс зберігає лише знайдене пошуком "
+                              f"(«повний індекс» у налаштуваннях вимкнено), тож ці "
+                              f"закупівлі до вибірки не потраплять.")
+            return {}
+        rows, with_method = self.db.index_method_coverage(self._date_from, self._date_to)
+        if not with_method:
+            self._log("warn",
+                      f"{blocked} Але в індексі за цей період типу процедури немає — його "
+                      f"зібрано раніше, ніж програма почала його зберігати. Щоб добрати ці "
+                      f"закупівлі, перебудуйте індекс за період у «Налаштуваннях» "
+                      f"(«Очистити індекс» → «Побудувати індекс за період»). Зараз вони до "
+                      f"вибірки не потраплять.")
+            return {}
+        found = self.db.index_by_method(methods, self._date_from, self._date_to)
+        fresh = {tid: uuid for tid, uuid in found.items() if tid not in known}
+        share = with_method / rows if rows else 0
+        gap = ("" if share > 0.99 else
+               f" Увага: тип процедури відомий лише для {share:.0%} індексу за період, "
+               f"решту зібрано раніше — там могло лишитися ще кілька таких закупівель.")
+        self._log("info",
+                  f"Процедуру {names} пошук назвати не може, тому добираю її зі стрічки "
+                  f"змін: у індексі за період таких закупівель {_spaced(len(found))}, "
+                  f"нових для цієї вибірки — {_spaced(len(fresh))}. Далі вони пройдуть "
+                  f"ті самі фільтри, що й решта.{gap}")
+        return fresh
+
     def _summary_budget(self) -> int:
         """Скільки закупівель ще дешевше опитати поштучно, ніж будувати індекс.
 
@@ -273,6 +332,7 @@ class Pipeline:
                 parsed["row"], lots=parsed["lots"], items=parsed["items"],
                 bids=parsed["bids"], awards=parsed["awards"],
                 contracts=parsed["contracts"], docs=parsed["docs"],
+                cancellations=parsed["cancellations"],
             )
             # У режимі «тільки дані» на диску не з'являється нічого: тека з
             # самою лише карткою — це шум, а самі дані вже в базі.
@@ -488,6 +548,8 @@ class Pipeline:
 
         done = 0
         saved = 0
+        gone = 0                       # картки, яких каталог більше не віддає
+        failed = 0                     # решта — справжні збої, їх видно поштучно
         for pid in todo:
             self.client.check_cancel()
             try:
@@ -495,7 +557,15 @@ class Pipeline:
             except Cancelled:
                 raise
             except Exception as exc:
-                self._log("warn", f"Картка {pid[:8]}…: {exc}")
+                if _card_gone(exc):
+                    gone += 1
+                else:
+                    failed += 1
+                    if failed <= MARKET_WARN_LIMIT:
+                        self._log("warn", f"Картка {pid[:8]}…: {exc}")
+                    elif failed == MARKET_WARN_LIMIT + 1:
+                        self._log("warn", "Далі невдалі картки не перелічую — "
+                                          "їхня кількість буде в підсумку.")
                 done += 1
                 continue
             # Назву категорії картка тримає кодом — розкриваємо її окремо
@@ -510,6 +580,16 @@ class Pipeline:
             self._progress("Картки товарів", done, len(todo))
             if done % 20 == 0:
                 self._tick()
+        if gone:
+            self._log("warn",
+                      f"Каталог не віддав {_spaced(gone)} карток із {_spaced(len(todo))} "
+                      f"({gone / max(len(todo), 1):.0%}): товар посилається на категорію, "
+                      f"якої вже немає в довіднику — HTTP 404 «Category not found». Це не "
+                      f"збій зв'язку й не наша помилка: так само не читаються картки, "
+                      f"узяті з власної стрічки каталогу. Здебільшого це давні картки, "
+                      f"які лишилися в пошуку зі статусом «active».")
+        if failed:
+            self._log("warn", f"Ще {_spaced(failed)} карток не прочиталися з інших причин.")
         self.result.products = saved + skipped
         in_base = self.db.scalar("SELECT COUNT(*) FROM products") or 0
         self._log("info", f"Картки товарів: збережено {_spaced(saved)}, "
@@ -553,11 +633,12 @@ class Pipeline:
                                       f"{total:,} рядків попередніх вибірок."
                               .replace(",", " "))
             cards = self.discover()
-            if not cards:
-                self._log("warn", "За заданими фільтрами нічого не знайдено.")
-                return self.result
-            mapping = self.resolve(list(cards.keys()))
+            # Порожній пошук ще не кінець: процедури, назв яких пошук не
+            # приймає, беруться зі стрічки й після нього.
+            mapping = self.resolve(list(cards.keys())) if cards else {}
+            mapping.update(self.pickup_unnamed(mapping))
             if not mapping:
+                self._log("warn", "За заданими фільтрами нічого не знайдено.")
                 return self.result
             rows = self.load_tenders(mapping)
             if self.p.download_files and rows:
@@ -590,6 +671,20 @@ def _query_in(db: Database, sql: str, values: list[str], *, column: str = "uuid"
         marks = ",".join("?" * len(part))
         rows += db.query(f"{sql} WHERE {column} IN ({marks})", part)
     return rows
+
+
+def _card_gone(exc: Exception) -> bool:
+    """Чи це «такої картки більше немає», а не тимчасовий збій.
+
+    Каталог відповідає ``404 {"errors": ["Category not found"]}`` на товар, чия
+    категорія вилучена з довідника. Перевірено на живому API 01.09.2026: так
+    відповідають і картки, узяті з власної стрічки каталогу (усі вісім
+    найдавніших — 404, усі вісім найновіших — 200), тож це стан їхніх даних, а
+    не наша помилка. Недокументований проксі порталу, який колись віддавав ті
+    самі картки, тепер відповідає 503, тож запасного джерела немає.
+    """
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None) == 404
 
 
 def _write_json(folder: Path, tender_id: str, data: dict) -> None:
@@ -631,7 +726,12 @@ class _Discovery:
     def __init__(self, pipe: "Pipeline"):
         self.pipe = pipe
         self.codes = pipe._cpv_codes()
-        self.methods = list(pipe.p.methods or [])
+        # Процедуру із задовгою назвою не можна класти в тіло запиту навіть
+        # тоді, коли користувач сам позначив її у фільтрі: сервер відповідає
+        # 422 і валить увесь збір. Відкладаємо її на добір зі стрічки.
+        wanted = list(pipe.p.methods or [])
+        self.methods = [m for m in wanted if len(m) <= PROC_TYPE_MAX_LEN]
+        self.unnamed_asked = {m for m in wanted if len(m) > PROC_TYPE_MAX_LEN}
         self.base = {
             "text": pipe.p.text or "",
             "tenderer": [e for e in (pipe.p.tenderers or []) if e],
@@ -639,6 +739,10 @@ class _Discovery:
             "status": list(pipe.p.statuses or []),
         }
         self.cards: dict[str, dict] = {}
+        #: Процедури, назви яких пошук не приймає (довші за 30 символів) і які
+        #: через це випали — чи з розрізу за процедурою, чи прямо з фільтра
+        #: користувача. Їх добирає :meth:`Pipeline.pickup_unnamed`.
+        self.unnamed: set[str] = set(self.unnamed_asked)
         #: Скільки сторінок пройдено і скільки їх очікується; верхню оцінку
         #: дає проба, бо разом із нею приходить `total`.
         self.pages = 0
@@ -647,6 +751,14 @@ class _Discovery:
         #: плани збирає складальник сміття, і той самий ``id()`` міг би
         #: дістатися новому кортежу.
         self.page_hint: dict[tuple, int] = {}
+        #: Скільки записів має план за пробою (сервер обрізає на стелі).
+        self.totals: dict[tuple, int] = {}
+        #: Найдавніша дата, до якої план дістає, якщо стелі не вистачило.
+        self.horizons: dict[tuple, str] = {}
+        #: Плани, яким стелі не вистачило на весь період.
+        self.short: list = []
+        #: Чи попереду ще друга хвиля з розрізом за замовником.
+        self.buyers_ahead = True
 
     # --- службове ---------------------------------------------------------
 
@@ -657,24 +769,38 @@ class _Discovery:
         мусять іти через нього: він відкидає порожні поля, а сервер порожній
         ``status`` чи ``text`` відхиляє з HTTP 422.
         """
-        batch, procs = plan
+        batch, procs, buyers = plan
         q = dict(self.base)
         if batch:
             q["cpv"] = list(batch)
         if procs:
             q["proc_type"] = list(procs)
+        if buyers:
+            # Перелік замовників плану вужчий за фільтр користувача (він із
+            # нього ж і зроблений), тож заміщає його, а не додається.
+            q["buyer"] = list(buyers)
         return q
 
     @staticmethod
     def _describe(plan) -> str:
-        batch, procs = plan
+        batch, procs, buyers = plan
         what = f"{len(batch)} код(ів)" if batch else "без кодів"
-        return f"{what}, {procs[0]}" if len(procs) == 1 else what
+        if len(procs) == 1:
+            what += f", {procs[0]}"
+        if buyers:
+            what += f", {len(buyers)} замовник(ів)"
+        return what
 
     @staticmethod
     def _key(plan) -> tuple:
-        batch, procs = plan
-        return (tuple(batch), tuple(procs))
+        batch, procs, buyers = plan
+        return (tuple(batch), tuple(procs), tuple(buyers))
+
+    @staticmethod
+    def _buyer_of(row: dict) -> str:
+        """ЄДРПОУ замовника з картки пошуку — основа розрізу за замовником."""
+        entity = row.get("procuringEntity") or {}
+        return str((entity.get("identifier") or {}).get("id") or "").strip()
 
     def _ask(self, plan, page: int) -> dict:
         body = SearchApi.build_body(page=page, **self._query_of(plan))
@@ -693,22 +819,25 @@ class _Discovery:
 
     # --- фаза 1: план -----------------------------------------------------
 
-    def _probe(self, plan) -> tuple[bool, int]:
-        """``(чи покриє план період, скільки сторінок він займе)``.
+    def _probe(self, plan) -> tuple[bool, int, str]:
+        """``(чи покриє план період, скільки сторінок, найдавніша досяжна дата)``.
 
         Перший запит дає ``total``, другий — дату на останній доступній
-        сторінці. Якщо записів менше за стелю, другий запит не потрібен.
+        сторінці. Якщо записів менше за стелю, другий запит не потрібен, і
+        дата ні до чого: план і так дістає до кінця.
         """
         first = self._ask(plan, 1)
         total = int(first.get("total") or 0)
         pages = max(1, min(SEARCH_MAX_PAGE, -(-total // SEARCH_PAGE_SIZE)))
         self.page_hint[self._key(plan)] = pages
+        self.totals[self._key(plan)] = total
         if total < SEARCH_MAX_RESULTS:
-            return True, pages
+            return True, pages, ""
         last = self._ask(plan, pages)
         deepest = min((d for d in (self.pipe._published(r) for r in last.get("data") or []) if d),
                       default="")
-        return (not deepest or deepest <= self.pipe._date_from), pages
+        self.horizons[self._key(plan)] = deepest
+        return (not deepest or deepest <= self.pipe._date_from), pages, deepest
 
     def _refine(self, plan) -> list | None:
         """Уточнює план, який не дістає до початку періоду.
@@ -718,45 +847,84 @@ class _Discovery:
         перетинів (перевірено) і дає глибину на роки замість місяців, бо стеля
         рахується для кожного запиту окремо.
         """
-        batch, procs = plan
+        batch, procs, buyers = plan
         if len(batch) > 1:
             half = len(batch) // 2
-            return [(batch[:half], procs), (batch[half:], procs)]
+            return [(batch[:half], procs, buyers), (batch[half:], procs, buyers)]
+        parts = self._by_procedure(plan)
+        if parts:
+            return parts
+        if len(buyers) > 1:
+            # Третій розріз — за замовником. Кожна закупівля має рівно одного,
+            # а список ЄДРПОУ сервер об'єднує через АБО (перевірено: 1 + 1 = 2)
+            # і приймає їх щонайменше 20 000 в одному запиті.
+            half = len(buyers) // 2
+            return [(batch, procs, buyers[:half]), (batch, procs, buyers[half:])]
+        return None
+
+    def _by_procedure(self, plan) -> list | None:
+        """Розріз за процедурою — лише поки її ще не задано."""
+        batch, procs, buyers = plan
         if procs:
             return None
         pool = self.methods or list(METHOD_LABELS)
         usable = [m for m in pool if len(m) <= PROC_TYPE_MAX_LEN]
-        for skipped in (m for m in pool if len(m) > PROC_TYPE_MAX_LEN):
-            self.pipe._log("warn", f"Процедуру «{METHOD_LABELS.get(skipped, skipped)}» "
-                                   f"пошук не приймає: її назва довша за "
-                                   f"{PROC_TYPE_MAX_LEN} символів. Такі закупівлі до "
-                                   f"вибірки не потраплять — їх одиниці.")
-        return [(batch, [m]) for m in usable] if len(usable) > 1 else None
+        # Довгі назви пошук не приймає взагалі, тож розріз за процедурою їх
+        # губить. Тут лише запам'ятовуємо котрі — добирає їх зі стрічки змін
+        # :meth:`Pipeline.pickup_unnamed`, а сказати про це досить один раз на
+        # весь пошук, а не на кожен поділений запит.
+        self.unnamed.update(m for m in pool if len(m) > PROC_TYPE_MAX_LEN)
+        return [(batch, [m], buyers) for m in usable] if len(usable) > 1 else None
 
     def _plan_out(self, plan) -> list | None:
         """Проба → або план готовий до гортання, або його треба уточнити."""
-        covers, _pages = self._probe(plan)
+        covers, _pages, horizon = self._probe(plan)
         if covers:
             return None
         parts = self._refine(plan)
         if parts:
             return parts
-        self.pipe._log("warn", f"Запит ({self._describe(plan)}) віддає щонайбільше "
-                               f"{_spaced(SEARCH_MAX_RESULTS)} записів, і їх не вистачає "
-                               f"на весь період. Частина закупівель не потрапить — "
-                               f"звузьте період або перелік кодів.")
+        with self.pipe._lock:
+            self.short.append(plan)
+        if not plan[2] and self.buyers_ahead:
+            # Розріз за замовником ще попереду: перелік ЄДРПОУ збереться з
+            # самої видачі, тож зараз лякати користувача нема чим — скаже
+            # :meth:`_by_buyer`, коли стане видно, що з цього вийшло.
+            return None
+        self._warn_ceiling(plan, horizon)
         return None
 
-    def _build_plan(self) -> list:
+    def _warn_ceiling(self, plan, horizon: str = "") -> None:
+        """Каже, докуди запит дістає, коли ділити його вже нема чим.
+
+        У пошуку немає ані фільтра за датою, ані за регіоном чи сумою, розмір
+        сторінки й порядок видачі незмінні, а сторінки за 500-ту не існує
+        (перевірено на живому API). Тому вікно в минуле не зсувається, і чесна
+        відповідь — назвати дату, до якої запит дістав.
+        """
+        horizon = horizon or self.horizons.get(self._key(plan), "")
+        reach = (f" Він дістає лише до {horizon}, а період починається "
+                 f"{self.pipe._date_from} — усе, що давніше, не потрапить."
+                 if horizon else "")
+        self.pipe._log("warn", f"Запит ({self._describe(plan)}) упирається у стелю пошуку "
+                               f"— {_spaced(SEARCH_MAX_RESULTS)} записів.{reach} "
+                               f"Портал віддає видачу тільки від найновіших і не має "
+                               f"фільтра за датою, тож зсунути вікно в минуле не вийде: "
+                               f"зарадить лише пізніша дата «з» або вужчий перелік кодів.")
+
+    def _build_plan(self, seeds=None) -> list:
         """Складає перелік запитів, готових до гортання.
 
         Спершу з'ясовуємо глибину всіх запитів і лише потім гортаємо: так до
         початку гортання відома загальна кількість сторінок, а отже смуга
         показує чесний відсоток. Планування коштує один-два запити на план — на
         річному періоді це близько тридцяти запитів за кілька секунд.
+
+        ``seeds`` — з чого починати; друга хвиля подає сюди ті самі запити,
+        але вже з переліком замовників.
         """
         pipe = self.pipe
-        plans = deque([(list(self.codes), self.methods)])
+        plans = deque(seeds if seeds is not None else [(list(self.codes), self.methods, ())])
         ready: list = []
         with ThreadPoolExecutor(pipe.s.search_concurrency) as pool:
             while plans:
@@ -827,15 +995,71 @@ class _Discovery:
 
     # --- усе разом --------------------------------------------------------
 
+    def _crawl(self, ready: list) -> None:
+        with ThreadPoolExecutor(self.pipe.s.search_concurrency) as pool:
+            for _ in pool.map(self._walk, ready):
+                self.pipe._tick()
+
+    def _by_buyer(self) -> None:
+        """Друга хвиля: переповнені запити перегортаються за замовниками.
+
+        Стеля пошуку — не на тому, скільки записів брати, а на тому, які
+        взагалі мають адресу: сторінки за 500-ту не існує
+        (`The page may not be greater than 500`). Тому дістатися глибших
+        записів можна лише запитом, у якому вони опиняться в перших 10 000, —
+        тобто вужчим фільтром. Замовник для цього годиться: у кожної закупівлі
+        він рівно один, а перелік ЄДРПОУ пошук об'єднує через АБО.
+
+        Перелік береться з карток, які й так перегорнуто: пошук віддає
+        ``procuringEntity`` у кожному записі, тож це не коштує жодного запиту.
+        Звідси й межа способу — замовника, якого не було видно в межах стелі,
+        у розрізі не буде. Про це кажемо прямо.
+        """
+        pipe = self.pipe
+        if not self.short:
+            return
+        self.buyers_ahead = False
+        short, self.short = list(self.short), []
+        buyers = sorted({b for b in map(self._buyer_of, self.cards.values()) if b})
+        limit = set(self.base.get("buyer") or ())
+        if limit:                      # користувач і сам звузив коло замовників
+            buyers = [b for b in buyers if b in limit]
+        if len(buyers) < 2:
+            pipe._log("warn", "Розрізати переповнені запити за замовником не вийшло: "
+                              "у видачі не видно достатньо різних ЄДРПОУ замовників.")
+            for plan in short:
+                self._warn_ceiling(plan)
+            return
+        pipe._log("info",
+                  f"{len(short)} запит(ів) уперлися у стелю. Перегортаю їх, розрізавши "
+                  f"за {_spaced(len(buyers))} замовниками, яких видно у вибірці — "
+                  f"кожна група дістає власні {_spaced(SEARCH_MAX_RESULTS)} записів.")
+        before = len(self.cards)
+        ready = self._build_plan([(codes, procs, buyers) for codes, procs, _b in short])
+        self._crawl(ready)
+        gained = len(self.cards) - before
+        real = sum(self.totals.get(self._key(p), 0) for p in ready)
+        pipe._log("info",
+                  f"Розріз за замовником додав {_spaced(gained)} закупівель. У цих "
+                  f"запитах щонайменше {_spaced(real)} записів — стеля показувала "
+                  f"{_spaced(SEARCH_MAX_RESULTS)}. Замовники, яких не було видно в межах "
+                  f"стелі, у розріз не потрапили, тож повноти це не гарантує.")
+
     def run(self) -> dict[str, dict]:
         pipe = self.pipe
+        if self.unnamed_asked and not self.methods:
+            # У фільтрі лишилися самі лише процедури, яких пошук не знає:
+            # гортати нема чого — все одно довелося б викинути кожен запис.
+            pipe.unnamed_methods = set(self.unnamed)
+            pipe._log("info", "У фільтрі лише процедури, назв яких пошук не приймає, "
+                              "тож шукати нема чого — беру їх тільки зі стрічки змін.")
+            return {}
         pipe._log("info", f"Пошук: {len(self.codes) or '—'} код(ів) ДК021, період "
                           f"{pipe._date_from} … {pipe._date_to}.")
-        ready = self._build_plan()
-        with ThreadPoolExecutor(pipe.s.search_concurrency) as pool:
-            for _ in pool.map(self._walk, ready):
-                pipe._tick()
+        self._crawl(self._build_plan())
+        self._by_buyer()
         pipe.result.found = len(self.cards)
+        pipe.unnamed_methods = set(self.unnamed)
         pipe._progress("Пошук закупівель", self.pages, self.pages)
         pipe._log("info", f"Знайдено закупівель за фільтром: {_spaced(len(self.cards))} "
                           f"(сторінок пройдено: {_spaced(self.pages)})")

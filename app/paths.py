@@ -12,6 +12,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # Вбудовані довідники: класифікатор ДК021 та перелік регіонів.
 BUNDLED_DATA = PROJECT_ROOT / "data"
 
+#: Назва єдиної теки, куди програма пише все своє: документи закупівель, книги
+#: вивантаження, збережений журнал. Тримаємо саме назву, а не готовий шлях —
+#: у ``settings.json`` вона й зберігається відносною (див. ``store_output_dir``).
+DOWNLOADS_DIRNAME = "downloads"
+
 
 def user_data_dir() -> Path:
     """Тека для бази й налаштувань.
@@ -25,8 +30,47 @@ def user_data_dir() -> Path:
 
 
 def default_output_dir() -> Path:
-    """Тека для завантажених файлів і вивантажених таблиць."""
-    return PROJECT_ROOT / "downloads"
+    """Тека для завантажених файлів і вивантажених таблиць — ``downloads``.
+
+    Створюємо одразу: git не зберігає порожніх тек, тож на свіжій копії її
+    немає, а діалогам збереження треба з чогось починати — інакше вони
+    відкриються там, де їх лишила система, тобто поза проєктом.
+    """
+    folder = PROJECT_ROOT / DOWNLOADS_DIRNAME
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def resolve_output_dir(value: Path | str | None) -> Path:
+    """Значення ``Settings.output_dir`` → справжній шлях.
+
+    Порожнє значення й **відносний** шлях відлічуються від кореня проєкту, тож
+    типове ``downloads`` лишається в проєкті на будь-якій машині. Абсолютний
+    шлях — свідомий вибір користувача в налаштуваннях, його не чіпаємо.
+
+    Раніше типовим значенням був абсолютний шлях, а ``settings.json`` лежить у
+    репозиторії: на іншій машині збір ішов у теку з чужого профілю або, якщо
+    диска не існує, падав на порожньому переліку книг.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return default_output_dir()
+    path = Path(text)
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def store_output_dir(value: Path | str | None) -> str:
+    """Значення для запису в ``settings.json``: усередині проєкту — відносне.
+
+    Так налаштування переносяться між машинами, не тягнучи за собою чужого
+    ``C:/Users/...``; тека поза проєктом лишається абсолютною, бо коротший
+    запис для неї нічого не означав би.
+    """
+    path = resolve_output_dir(value)
+    try:
+        return path.resolve().relative_to(PROJECT_ROOT).as_posix() or DOWNLOADS_DIRNAME
+    except ValueError:
+        return str(path)
 
 
 def export_path(stem: str, suffix: str = ".xlsx",
@@ -38,7 +82,7 @@ def export_path(stem: str, suffix: str = ".xlsx",
     аналітики перебирає саме ``Settings.output_dir``, тож книга, збережена
     повз цю теку, звідти не видно.
     """
-    folder = Path(folder) if folder else default_output_dir()
+    folder = resolve_output_dir(folder)
     folder.mkdir(parents=True, exist_ok=True)
     return folder / f"{stem}-{datetime.now():%Y-%m-%d-%H%M}{suffix}"
 

@@ -336,7 +336,11 @@ class SearchPage(QWidget):
         self.progress.setRange(0, total)
         self.progress.setValue(done)
         percent = int(done / total * 100)
-        self.progress.setFormat(f"{stage} — {done:,} / {total:,}  ({percent}%)".replace(",", " "))
+        # Пробіл у тисячах ставимо тільки числам. Назва етапу приходить із
+        # ядра й складається на льоту — кома в ній перетворилася б на пробіл
+        # разом з усім рядком, як це вже бувало в журналі.
+        counters = (f"{done:,}".replace(",", " "), f"{total:,}".replace(",", " "))
+        self.progress.setFormat(f"{stage} — {counters[0]} / {counters[1]}  ({percent}%)")
 
     def set_stats(self, stats: dict) -> None:
         self.tile_found.set(f"{stats.get('found', 0):,}".replace(",", " "))

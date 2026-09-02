@@ -115,10 +115,30 @@ CREATE TABLE IF NOT EXISTS awards (
     value_amount    REAL,
     currency        TEXT,
     supplier_name   TEXT,
-    supplier_edrpou TEXT
+    supplier_edrpou TEXT,
+    -- Підстава відхилення переможця та її пояснення. У чинному рішенні тут
+    -- натомість «Визнаний переможцем», тож причиною це є лише при статусі
+    -- `unsuccessful` (див. app/core/rejections.py).
+    reason          TEXT,
+    explanation     TEXT,
+    qualified       INTEGER,   -- 1/0/NULL: NULL — поля в картці не було
+    eligible        INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_awards_tender ON awards(tender_uuid);
 CREATE INDEX IF NOT EXISTS ix_awards_edrpou ON awards(supplier_edrpou);
+
+-- Відміна всієї закупівлі: перемога зникає разом із закупівлею, а не через
+-- рішення про учасника. Підстава тут із переліку, а не вільний текст.
+CREATE TABLE IF NOT EXISTS cancellations (
+    id           TEXT PRIMARY KEY,
+    tender_uuid  TEXT NOT NULL,
+    status       TEXT,
+    reason_type  TEXT,
+    reason       TEXT,
+    lot_id       TEXT,
+    date         TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_cancel_tender ON cancellations(tender_uuid);
 
 CREATE TABLE IF NOT EXISTS contracts (
     id              TEXT PRIMARY KEY,
@@ -227,7 +247,26 @@ class Database:
         self._lock = threading.RLock()
         with self._lock:
             self.conn.executescript(SCHEMA)
+            self._migrate()
             self.conn.commit()
+
+    #: Колонки, дописані до вже наявних таблиць: ``таблиця → (назва, тип)``.
+    #: ``CREATE TABLE IF NOT EXISTS`` над старою базою мовчки нічого не робить,
+    #: тож без цього переносу база, зібрана попередньою версією, лишилася б
+    #: без причин відмов — і збір падав би на першій же вставці.
+    ADDED_COLUMNS = {
+        "awards": (("reason", "TEXT"), ("explanation", "TEXT"),
+                   ("qualified", "INTEGER"), ("eligible", "INTEGER")),
+    }
+
+    def _migrate(self) -> None:
+        for table, columns in self.ADDED_COLUMNS.items():
+            have = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+            if not have:                       # таблиці ще немає — її створить схема
+                continue
+            for name, kind in columns:
+                if name not in have:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
 
     def close(self) -> None:
         with self._lock:
@@ -288,6 +327,43 @@ class Database:
     def index_size(self) -> int:
         return int(self.scalar("SELECT COUNT(*) FROM tender_index") or 0)
 
+    # Дата в індексі береться з самого номера: ``UA-2026-08-21-007779-a`` —
+    # це і є дата оприлюднення, за якою відбирає й пошук порталу. Окремої
+    # колонки з датою в індексі немає (стрічку тягнуть без неї, щоб запис
+    # важив менше), а номер її містить завжди — перевірено на 1,8 млн рядків,
+    # жодного винятку.
+    _INDEX_DAY = "substr(tender_id, 4, 10)"
+
+    def index_by_method(self, methods: Sequence[str], since: str, until: str
+                        ) -> dict[str, str]:
+        """``{tenderID: uuid}`` для вказаних процедур за період."""
+        methods = [m for m in methods if m]
+        if not methods:
+            return {}
+        marks = ",".join("?" * len(methods))
+        rows = self.query(
+            f"SELECT tender_id, uuid FROM tender_index WHERE method IN ({marks})"
+            f" AND {self._INDEX_DAY} BETWEEN ? AND ?",
+            [*methods, since[:10], until[:10]],
+        )
+        return {r["tender_id"]: r["uuid"] for r in rows}
+
+    def index_method_coverage(self, since: str, until: str) -> tuple[int, int]:
+        """``(рядків індексу за період, із них із типом процедури)``.
+
+        Індекси, зібрані до того, як у стрічку додали тип процедури, лежать із
+        порожньою колонкою — і добирати з них нічого. Ця пара чисел дозволяє
+        сказати про це прямо, а не мовчки нічого не знайти.
+        """
+        row = self.query(
+            f"SELECT COUNT(*) AS all_rows, SUM(method <> '') AS with_method"
+            f" FROM tender_index WHERE {self._INDEX_DAY} BETWEEN ? AND ?",
+            [since[:10], until[:10]],
+        )
+        if not row:
+            return 0, 0
+        return int(row[0]["all_rows"] or 0), int(row[0]["with_method"] or 0)
+
     def coverage_days(self) -> set[str]:
         return {r["day"] for r in self.query("SELECT day FROM index_coverage WHERE done_at IS NOT NULL")}
 
@@ -304,8 +380,8 @@ class Database:
     #: Таблиці зі зібраними картками. Індекс tenderID→UUID і покриття стрічки
     #: змін сюди не входять: вони здобуваються дорого й від предмета збору не
     #: залежать, тож переживають очищення.
-    COLLECTED = ("documents", "contracts", "awards", "bids", "items", "lots",
-                 "tenders", "product_specs", "products")
+    COLLECTED = ("documents", "contracts", "awards", "cancellations", "bids",
+                 "items", "lots", "tenders", "product_specs", "products")
 
     def reset_collected(self) -> dict[str, int]:
         """Прибирає зібрані картки, лишаючи індекс і журнал запусків.
@@ -328,7 +404,8 @@ class Database:
         return removed
 
     def save_tender(self, row: dict, *, lots: list, items: list, bids: list,
-                    awards: list, contracts: list, docs: list) -> None:
+                    awards: list, contracts: list, docs: list,
+                    cancellations: list | None = None) -> None:
         cols = list(row.keys())
         marks = ",".join("?" * len(cols))
         updates = ",".join(f"{c}=excluded.{c}" for c in cols if c != "uuid")
@@ -339,7 +416,7 @@ class Database:
                 [row[c] for c in cols],
             )
             uuid = row["uuid"]
-            for table in ("lots", "items", "bids", "awards", "contracts"):
+            for table in ("lots", "items", "bids", "awards", "contracts", "cancellations"):
                 self.conn.execute(f"DELETE FROM {table} WHERE tender_uuid=?", (uuid,))
             self.conn.executemany(
                 "INSERT OR REPLACE INTO lots(id,tender_uuid,title,description,status,value_amount,currency)"
@@ -352,7 +429,11 @@ class Database:
                 "bidder_name,bidder_edrpou,bidder_region) VALUES(?,?,?,?,?,?,?,?,?,?)", bids)
             self.conn.executemany(
                 "INSERT OR REPLACE INTO awards(id,tender_uuid,lot_id,status,date,value_amount,currency,"
-                "supplier_name,supplier_edrpou) VALUES(?,?,?,?,?,?,?,?,?)", awards)
+                "supplier_name,supplier_edrpou,reason,explanation,qualified,eligible)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", awards)
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO cancellations(id,tender_uuid,status,reason_type,reason,"
+                "lot_id,date) VALUES(?,?,?,?,?,?,?)", cancellations or ())
             self.conn.executemany(
                 "INSERT OR REPLACE INTO contracts(id,tender_uuid,contract_id,status,date_signed,"
                 "value_amount,currency,supplier_name,supplier_edrpou) VALUES(?,?,?,?,?,?,?,?,?)", contracts)

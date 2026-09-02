@@ -191,10 +191,32 @@ def parse_tender(tender: dict, *, keep_urls: bool = True) -> dict:
         name, edrpou, _ = _first_org(award, "suppliers")
         if award.get("id"):
             supplier_by_award[award["id"]] = (name, edrpou)
+        # `title` і `description` — це підстава відхилення переможця та її
+        # пояснення; у чинному рішенні там натомість стоїть «Визнаний
+        # переможцем», тож читати їх як причину можна лише зі статусу
+        # `unsuccessful` (див. :mod:`app.core.rejections`). Нові поля дописані
+        # в кінець кортежу навмисно: конвеєр адресує ЄДРПОУ переможця за
+        # індексом 8.
         awards.append((
             award.get("id"), uuid, award.get("lotID"), award.get("status"), award.get("date"),
             _num((award.get("value") or {}).get("amount")),
             (award.get("value") or {}).get("currency"), name, edrpou,
+            award.get("title") or "", award.get("description") or "",
+            _flag(award.get("qualified")), _flag(award.get("eligible")),
+        ))
+
+    # Відміна всієї закупівлі — окрема від відхилення переможця подія: тут
+    # перемогу забирає не рішення про учасника, а зникнення самої закупівлі.
+    # На відміну від причини відхилення, підстава тут із переліку
+    # (`reasonType`), і лише обґрунтування — вільний текст.
+    cancellations = []
+    for cancel in (tender.get("cancellations") or []):
+        if not isinstance(cancel, dict):
+            continue
+        cancellations.append((
+            cancel.get("id"), uuid, cancel.get("status"), cancel.get("reasonType") or "",
+            cancel.get("reason") or "", cancel.get("relatedLot"),
+            cancel.get("date") or cancel.get("dateCanceled") or "",
         ))
 
     contracts = []
@@ -258,8 +280,8 @@ def parse_tender(tender: dict, *, keep_urls: bool = True) -> dict:
     }
     return {
         "row": row, "lots": lots, "items": items, "bids": bids,
-        "awards": awards, "contracts": contracts, "docs": doc_rows,
-        "documents_meta": docs_raw,
+        "awards": awards, "contracts": contracts, "cancellations": cancellations,
+        "docs": doc_rows, "documents_meta": docs_raw,
     }
 
 
@@ -268,3 +290,13 @@ def _num(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _flag(value: Any) -> int | None:
+    """``True/False`` → ``1/0``, а відсутнє поле лишається порожнім.
+
+    Різниця істотна: ``eligible`` приходить не в кожному рішенні (виміряно:
+    18 зі 106 нечинних), і нуль замість «невідомо» читався б як «не
+    відповідає кваліфікаційним критеріям».
+    """
+    return None if value is None else int(bool(value))

@@ -69,7 +69,7 @@ class PlayersMixin:
         self.report.ours = [self._profile(code, ours=True) for code in sorted(self.own)]
         self._build_ours_section()
         self._build_competitors_section()
-        self._step("Профілі гравців складено", 4)
+        self._step("Профілі гравців складено", 5)
 
     def _attribute_documents(self) -> dict[str, list[dict]]:
         """Файли за власником.
@@ -122,21 +122,34 @@ class PlayersMixin:
             profile.first_seen, profile.last_seen = days[0], days[-1]
 
         # --- товар і ТМ ---------------------------------------------------
+        # Два лічильники: у ``brand_counter`` йде все, з чим гравець виходив на
+        # торги, у ``sold_counter`` — лише виграні закупівлі. Різниця не
+        # косметична: питання «скільки ТМ він возить» і «скільки ТМ він
+        # реально продав» дають різні числа в того, хто багато подається й
+        # мало виграє.
         brand_counter: Counter[str] = Counter()
+        sold_counter: Counter[str] = Counter()
         type_counter: Counter[str] = Counter()
         for tender_id in won_tenders | bid_tenders:
+            found: Counter[str] = Counter()
             for item in self.items_by_tender.get(tender_id, ()):
-                brand_counter.update(self._brands_of(item["description"]))
-                kind = self._product_type(item["description"])
+                found.update(self._brands_of(item["description"]))
+                # Родовий тип, а не дослівна назва: інакше «Мишка» й «Миша»
+                # у портреті одного гравця стають двома різними товарами.
+                kind = self._product_group(item["description"])
                 if kind:
                     type_counter[kind] += 1
             if not self.items_by_tender.get(tender_id):
                 tender = self.tenders.get(tender_id) or {}
-                brand_counter.update(self._brands_of(tender.get("title", "")))
-                kind = self._product_type(tender.get("title", ""))
+                found.update(self._brands_of(tender.get("title", "")))
+                kind = self._product_group(tender.get("title", ""))
                 if kind:
                     type_counter[kind] += 1
+            brand_counter.update(found)
+            if tender_id in won_tenders:
+                sold_counter.update(found)
         profile.brands = brand_counter.most_common()
+        profile.sold_brands = sold_counter.most_common()
         total_brand_hits = sum(brand_counter.values())
         if profile.brands:
             profile.top_brand = profile.brands[0][0]
@@ -155,6 +168,18 @@ class PlayersMixin:
         kinds = Counter(tm.document_kind(d["title"], d["format"]) for d in docs)
         profile.certificates = kinds.get("Сертифікат / декларація відповідності", 0)
         profile.authorizations = kinds.get("Лист виробника / авторизація", 0)
+
+        # --- зірвані перемоги ---------------------------------------------
+        # Знаменник — перемоги плюс відмови самої компанії: питання «як часто
+        # її виграш зривається», а не «яку частку ринку вона втратила».
+        rejected = self.rejections_by_edrpou.get(edrpou, [])
+        profile.n_rejected = len(rejected)
+        profile.rejected_sum = sum(row["amount"] for row in rejected)
+        if rejected:
+            profile.reject_reason = Counter(
+                row["category"] for row in rejected).most_common(1)[0][0]
+            attempts = profile.n_tenders + profile.n_rejected
+            profile.reject_share = share(profile.n_rejected, attempts) if attempts else None
 
         profile.traits = self._traits(profile, deals, regions)
         profile.block = self._profile_block(profile, deals, bids, docs, kinds,
@@ -269,6 +294,22 @@ class PlayersMixin:
             if profile.authorizations:
                 parts.append(f"авторизаційних листів: {profile.authorizations}")
             traits.append("У поданих файлах — " + ", ".join(parts))
+        if profile.n_rejected:
+            # Частку показуємо лише там, де вона щось означає: одна відмова на
+            # одну перемогу — це «50%», і виглядає це переконливіше, ніж є.
+            # Разом із нею йдуть обидва числа: без знаменника «84,6%» читалося
+            # б як частка ринку, а не як «11 виграшів із 13 зірвалися».
+            if profile.reject_share is not None and profile.n_rejected >= MIN_FACTS:
+                traits.append(
+                    f"Зривається {pct(profile.reject_share)} виграшів: "
+                    f"{profile.n_rejected} з {profile.n_rejected + profile.n_tenders} "
+                    f"на {compact(profile.rejected_sum)} грн, найчастіше — "
+                    f"{profile.reject_reason.lower()}")
+            else:
+                traits.append(
+                    f"Зірваних перемог: {profile.n_rejected} на "
+                    f"{compact(profile.rejected_sum)} грн, найчастіше — "
+                    f"{profile.reject_reason.lower()}")
         return traits
 
     def _profile_block(self, profile: Profile, deals: list[dict], bids: list[dict],
@@ -300,6 +341,10 @@ class PlayersMixin:
              pct(profile.discount) if profile.discount is not None else "—"),
             ("Повторні замовники", pct(profile.repeat_share)),
             ("Активність", f"{profile.first_seen or '—'} — {profile.last_seen or '—'}"),
+            ("Зірвано перемог",
+             f"{count(profile.n_rejected)} на {compact(profile.rejected_sum)} грн"
+             if profile.n_rejected else "—"),
+            ("Причина зривів", profile.reject_reason or "—"),
         ]
         block.notes = list(profile.traits)
 
@@ -360,6 +405,15 @@ class PlayersMixin:
             block.tables.append(("Документи", (
                 ["Тип документа", "Файлів"],
                 [[name or "не класифіковано", n] for name, n in kinds.most_common()])))
+        rejected = self.rejections_by_edrpou.get(profile.edrpou, [])
+        if rejected:
+            block.tables.append(("Зірвані перемоги", (
+                ["Закупівля", "Дата", "Замовник", "Сума, грн", "Причина",
+                 "Формулювання замовника"],
+                [[row["tender_id"], row["date"], row["buyer"], round(row["amount"], 2),
+                  row["category"], row["reason"][:300]]
+                 for row in sorted(rejected, key=lambda r: -r["amount"])[:DETAIL_ROWS]])))
+
         block.tables.append(("Угоди", (
             ["Закупівля", "Дата", "Замовник", "Регіон", "Сума, грн", "Очікувана, грн",
              "Процедура", "Галузь", "Джерело"],
@@ -382,6 +436,10 @@ class PlayersMixin:
         Три можливі відповіді, і всі три однаково важливі: нас там не було,
         нас перебили ціною, або ціна була наша, а закупівля — ні (відхилення,
         невідповідність, дискваліфікація).
+
+        У третьому випадку здогадуватись більше не треба: якщо нас відхилили,
+        замовник назвав підставу, і вона лежить у тій самій картці. Тоді
+        замість «ціна була нижча — програли не за ціною» стоїть сама причина.
         """
         cached = self._loss_cache.get(edrpou)
         if cached is not None:
@@ -413,6 +471,10 @@ class PlayersMixin:
                 our_sum = min(ours)
                 gap = our_sum / min(theirs) - 1
                 verdict = "ціна була нижча — програли не за ціною"
+            ours_rejected = [row for row in self.rejections_by_tender.get(tender_id, ())
+                             if row["edrpou"] in self.own]
+            if ours_rejected:
+                verdict = "нас відхилили: " + ours_rejected[0]["category"].lower()
             rows.append([tender_id, tender.get("date", ""), tender.get("buyer", ""),
                          (tender.get("title", ""))[:80], round(winner_sum or 0, 2),
                          round(our_sum, 2) if our_sum else None,
@@ -496,20 +558,17 @@ class PlayersMixin:
                         [r[2] for r in top])], unit="шт", money_axis=False))
 
         if self.report.ours:
-            labels, values, accent = [], [], set()
-            for i, (edrpou, cell) in enumerate(self.ranking[:TOP_RIVALS]):
-                labels.append(self._short_name(edrpou))
-                values.append(cell["signed"])
-                if self.is_ours(edrpou):
-                    accent.add(i)
-            for profile in self.report.ours:
-                if profile.rank > TOP_RIVALS and profile.signed > 0:
-                    labels.append(self._short_name(profile.edrpou))
-                    values.append(profile.signed)
-                    accent.add(len(labels) - 1)
+            line, accent = self._visible_ranking(self.ranking, TOP_RIVALS)
             block.charts.insert(0, ChartData(
-                "Ми проти лідерів ринку", "hbar",
-                [Series("Сума угод", labels, values, accent=accent)], unit="грн"))
+                f"Ми проти лідерів ринку (топ-{TOP_RIVALS})", "hbar",
+                [Series("Сума угод",
+                        [self._rank_label(e, TOP_RIVALS) for e, _c in line],
+                        [cell["signed"] for _e, cell in line], accent=accent)],
+                unit="грн",
+                hint="Наші ТОВ виділені кольором і стоять у списку завжди: те, що не "
+                     f"ввійшло до топ-{TOP_RIVALS}, дописане в кінець із номером свого "
+                     "місця. Тут лише ті, у кого є підписані угоди — ЄДРПОУ без жодної "
+                     "угоди в рейтингу немає."))
         self.report.add("Наші ТОВ", block)
 
     def _coverage(self) -> dict | None:
@@ -653,9 +712,21 @@ class PlayersMixin:
                      "друга — про ціну, третя — про якість підготовки пропозиції."))
 
         if self.report.competitors:
+            # Наші ТОВ дописуємо в хвіст: без опорної смуги «а скільки в нас»
+            # висота стовпчиків конкурентів ні про що не говорить.
             top = self.report.competitors[:TOP_RIVALS]
+            line = [*top, *(p for p in self.report.ours if p.signed > 0)]
+            accent = {i for i, p in enumerate(line) if p.is_ours}
+            # Наше ТОВ стоїть у хвості незалежно від свого місця, тож номер
+            # ставимо завжди: без нього смуга наприкінці читалася б як останнє
+            # місце ринку.
+            labels = [f"{self._short_name(p.edrpou, 27)} (№{p.rank})"
+                      if p.is_ours and p.rank else self._short_name(p.edrpou)
+                      for p in line]
             block.charts.insert(0, ChartData(
-                "Найбільші конкуренти", "hbar",
-                [Series("Сума угод", [self._short_name(p.edrpou) for p in top],
-                        [p.signed for p in top])], unit="грн"))
+                f"Найбільші конкуренти (топ-{TOP_RIVALS}) і ми", "hbar",
+                [Series("Сума угод", labels, [p.signed for p in line], accent=accent)],
+                unit="грн",
+                hint="Кольором виділені наші ТОВ — вони показані для порівняння й до "
+                     "рейтингу конкурентів не входять."))
         self.report.add("Конкуренти", block)

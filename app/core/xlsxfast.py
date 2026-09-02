@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 
+import math
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -60,8 +61,17 @@ def _column(ref: str) -> int:
 
 
 def _from_serial(serial: float) -> datetime | float:
+    """Порядковий номер Excel → дата з часом.
+
+    Дробову частину переводимо в цілі мілісекунди, а не віддаємо
+    ``timedelta(days=...)`` як є: 0,572916666… доби — це 13:45:00, але у
+    подвійній точності воно виходить 13:44:59,999999, і час у книзі читався б
+    на секунду раніше, ніж його бачить Excel.
+    """
     try:
-        return EPOCH + timedelta(days=serial)
+        days = math.floor(serial)
+        millis = round((serial - days) * 86_400_000)
+        return EPOCH + timedelta(days=days, milliseconds=millis)
     except (OverflowError, ValueError):
         return serial
 

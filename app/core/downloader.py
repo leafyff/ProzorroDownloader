@@ -240,15 +240,38 @@ def _unlink(path: Path) -> None:
         pass
 
 
+#: Найдовше розширення, яке ще вважаємо розширенням.
+EXTENSION_MAX_LEN = 8
+
+
+def extension_of(name: str) -> str:
+    """Розширення в кінці імені — або порожньо, якщо це не воно.
+
+    Крапка в назві ще не означає розширення. Замовники раз у раз називають
+    файл датою («Протокол відхилення від 05.05.2026»), і наївне правило «усе
+    після останньої крапки» оголошувало розширенням ``.2026``. Наслідків два, і
+    обидва мовчазні: файл лягав на диск без розширення — Windows не знав, чим
+    його відкривати, — а фільтр типів викидав його як «не PDF», хоча MIME-тип
+    прямо казав, що це PDF.
+
+    Тому вимагаємо, щоб хвіст був короткий і містив хоч одну літеру: ``.7z``
+    і ``.p7s`` — розширення, ``.2026`` і ``.5`` — ні.
+    """
+    stem, dot, ext = str(name or "").rpartition(".")
+    if not dot or not stem or not 1 <= len(ext) <= EXTENSION_MAX_LEN:
+        return ""
+    if not ext.isalnum() or not any(ch.isalpha() for ch in ext):
+        return ""
+    return f".{ext.lower()}"
+
+
 def document_extension(doc: dict) -> str:
     """Розширення документа в нижньому регістрі, з крапкою: ``.pdf``.
 
     Береться з назви, а якщо її немає — визначається за MIME-типом,
     тобто рівно так само, як формується ім'я файлу на диску.
     """
-    name = file_name_for(doc)
-    _, dot, ext = name.rpartition(".")
-    return f".{ext.lower()}" if dot and len(ext) <= 8 else ""
+    return extension_of(file_name_for(doc))
 
 
 def is_signature(doc: dict) -> bool:
@@ -262,7 +285,7 @@ def file_name_for(doc: dict) -> str:
     """Ім'я файлу на диску для документа (без розведення збігів)."""
     title = (doc.get("title") or "").strip() or (doc.get("doc_id") or "file")
     name = safe_name(title, max_len=90)
-    if "." not in name[-6:]:
+    if not extension_of(name):
         fmt = (doc.get("format") or "").lower()
         ext = _EXTRA_MIME.get(fmt)
         if ext is None:

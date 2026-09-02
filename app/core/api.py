@@ -38,13 +38,19 @@ SEARCH_MAX_PAGE = 500          # обмеження серверу
 SEARCH_MAX_RESULTS = SEARCH_PAGE_SIZE * SEARCH_MAX_PAGE
 
 #: Поля стрічки змін. ЦБД дозволяє лише невеликий перелік
-#: (tenderID, status, procurementMethodType, dateCreated, procuringEntity, contracts).
+#: (tenderID, status, procurementMethodType, dateCreated, procuringEntity, contracts);
+#: ``items`` — а з ними й коди ДК021 — стрічка не віддає.
 #:
-#: Індексу потрібні тільки ``tenderID`` та ``id`` — більше з таблиці
-#: ``tender_index`` ніде не читається. Виміряно: із ``dateCreated,status``
-#: запис стрічки важить 209 байт, без них — 135, тобто на 36% менше. Побудова
-#: індексу на 99% складається з очікування мережі, тож це прямий виграш.
-FEED_OPT_FIELDS = "tenderID"
+#: Індексу потрібні ``tenderID`` та ``id``. Тип процедури доданий заради
+#: єдиної речі, якої **не вміє пошук порталу**: він відхиляє значення
+#: ``proc_type`` довші за 30 символів, а ``closeFrameworkAgreementSelectionUA``
+#: має 34 — тож «Відбір за рамковою угодою» знайти пошуком неможливо, і такі
+#: закупівлі добираються зі стрічки за цим полем.
+#:
+#: Виміряно: із ``dateCreated,status`` запис стрічки важить 209 байт, самий
+#: ``tenderID`` — 135, з типом процедури — 178 (+32%). Побудова індексу на 99%
+#: складається з очікування мережі, тож зайві поля тут коштують часу.
+FEED_OPT_FIELDS = "tenderID,procurementMethodType"
 
 
 class SearchApi:

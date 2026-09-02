@@ -10,6 +10,8 @@ from PySide6.QtWidgets import (
     QLineEdit, QListWidget, QListWidgetItem, QPushButton, QSizePolicy, QVBoxLayout, QWidget,
 )
 
+from ...core.xlsxload import as_num
+
 #: ЄДРПОУ юридичної особи — 8 цифр, РНОКПП фізичної — 10. Перевірка меж
 #: не дає розрізати один довгий номер на два «коди».
 EDRPOU_RE = re.compile(r"(?<!\d)\d{8,10}(?!\d)")
@@ -110,11 +112,24 @@ class MoneyEdit(QLineEdit):
         self.editingFinished.connect(self._reformat)
 
     def value(self) -> float | None:
-        digits = "".join(ch for ch in self.text() if ch.isdigit())
-        return float(digits) if digits else None
+        """Сума з поля; порожнє — «без обмеження».
+
+        Читаємо тим самим розбирачем, що й клітинки книги. Раніше тут лишалися
+        самі цифри, тож кома з'їдалася разом із рештою: «1 234,56» ставало
+        123 456 — фільтр «від» виходив у сто разів більшим, ніж просив
+        користувач, і мовчки відкидав усе. Валідатор поля кому й крапку
+        приймає, тож набрати таке — звичайна річ.
+        """
+        return as_num(self.text())
 
     def set_value(self, value: float | None) -> None:
-        self.setText(f"{value:,.0f}".replace(",", " ") if value else "")
+        if not value:
+            self.setText("")
+            return
+        # Копійки показуємо, лише коли вони є: інакше поле саме округлювало б
+        # набране, а наступне читання вертало б інше число.
+        text = f"{value:,.2f}" if value % 1 else f"{value:,.0f}"
+        self.setText(text.replace(",", " ").replace(".", ","))
 
     def _reformat(self) -> None:
         self.set_value(self.value())

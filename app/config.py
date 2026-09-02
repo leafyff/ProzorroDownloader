@@ -1,4 +1,4 @@
-"""Налаштування застосунку (зберігаються у %LOCALAPPDATA%/ProzorroDownloader/settings.json)."""
+"""Налаштування застосунку (зберігаються у settings.json у корені проєкту)."""
 from __future__ import annotations
 
 import json
@@ -7,7 +7,8 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
-from .paths import SETTINGS_FILE, default_output_dir
+from .paths import (SETTINGS_FILE, default_output_dir, resolve_output_dir,
+                    store_output_dir)
 
 # --- значення за замовчуванням --------------------------------------------
 
@@ -206,6 +207,9 @@ class Settings:
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["preset"] = self.preset.to_dict()
+        # Теку в межах проєкту пишемо відносною: файл лежить у репозиторії, і
+        # абсолютний шлях повів би збір на іншій машині в чужий профіль.
+        d["output_dir"] = store_output_dir(self.output_dir)
         return d
 
     #: Старі типові значення швидкості й те, чим вони стали після вимірів.
@@ -235,6 +239,10 @@ class Settings:
             d["resolve_mode"] = "auto"
         known = {f for f in cls.__dataclass_fields__}
         obj = cls(**{k: v for k, v in d.items() if k in known and k != "preset"})
+        # У пам'яті тримаємо готовий абсолютний шлях: споживачі (конвеєр,
+        # сторінки файлів та аналітики) підставляють значення прямо в ``Path``,
+        # а відносне залежало б від поточного каталогу процесу.
+        obj.output_dir = str(resolve_output_dir(obj.output_dir))
         obj.preset = preset
         return obj
 

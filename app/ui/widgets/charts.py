@@ -17,19 +17,10 @@ from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QSizePolicy, QToolTip, QWidget
 
-from ...core.report import ChartData, compact, money
+from ...core.report import (
+    OUTLIER_COLOR, OWN_COLOR, SERIES_COLORS, ChartData, compact, money,
+)
 from ..theme import palette
-
-#: Кольори рядів. Порядок підібраний так, щоб сусідні ряди різнилися і за
-#: тоном, і за яскравістю — графік лишається читабельним і в чорно-білому друці.
-SERIES_COLORS = [
-    "#3d7eff", "#3ecf8e", "#f0b429", "#a78bfa", "#22d3ee",
-    "#fb923c", "#f472b6", "#84cc16", "#e879f9", "#94a3b8",
-]
-#: Колір для виділених значень — наші ТОВ у рейтингах.
-OWN_COLOR = "#3ecf8e"
-#: Колір викидів у точковій хмарі.
-OUTLIER_COLOR = "#ef5f5f"
 
 
 def _fmt(value: float, chart: ChartData) -> str:
@@ -38,6 +29,25 @@ def _fmt(value: float, chart: ChartData) -> str:
     if chart.money_axis:
         return compact(value)
     return money(value)
+
+
+def _number(value) -> float | None:
+    """Значення, придатне до малювання; ``None`` — «тут даних немає».
+
+    ``None`` у ряду означає розрив — так домовлено в
+    :class:`app.core.report.Series`, і на цьому тримається графік прогнозу.
+    Лінія розрив уміла завжди, а стовпчики, смуги й кільце падали ще на
+    пошуку максимуму: ``max()`` не порівнює ``None`` із числом.
+
+    Нескінченність і NaN сюди ж. Вони приходять не з рушія, а з книги:
+    ``float("1e400")`` — це вже ``inf``, а Qt на такому значенні кидає
+    ``OverflowError`` просто з ``paintEvent``, і графік не малюється зовсім.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _nice_step(span: float, ticks: int = 4, whole: bool = False) -> float:
@@ -60,7 +70,8 @@ def _nice_step(span: float, ticks: int = 4, whole: bool = False) -> float:
 
 def _is_whole(series) -> bool:
     """Чи всі значення рядів цілі — тоді й вісь має бути цілою."""
-    return all(float(v).is_integer() for s in series for v in s.values)
+    return all(float(v).is_integer() for s in series for v in s.values
+               if v is not None)
 
 
 class ChartBase(QWidget):
@@ -212,7 +223,8 @@ class BarChart(ChartBase):
         plot = QRectF(64, 10 + legend_height, max(self.width() - 76, 40),
                       max(self.height() - bottom - 12 - legend_height, 40))
 
-        top = max((max(s.values) for s in series if s.values), default=0) or 1
+        top = max((n for s in series for n in map(_number, s.values)
+                   if n is not None), default=0) or 1
         step = _nice_step(top, whole=_is_whole(series))
         top = math.ceil(top / step) * step
         self._grid(painter, plot, top, step)
@@ -225,7 +237,9 @@ class BarChart(ChartBase):
         for gi, label in enumerate(labels):
             base_x = plot.left() + gi * group_width + bar_gap
             for si, item in enumerate(series):
-                value = item.values[gi] if gi < len(item.values) else 0
+                value = _number(item.values[gi]) if gi < len(item.values) else None
+                if value is None:                  # розрив: стовпчика немає
+                    continue
                 height = (value / top) * plot.height() if top else 0
                 rect = QRectF(base_x + si * bar_width, plot.bottom() - height,
                               max(bar_width - 1, 1.5), max(height, 0.5))
@@ -286,7 +300,8 @@ class HBarChart(ChartBase):
         plot = QRectF(label_width + 8, 6 + legend_height,
                       max(self.width() - label_width - 88, 40),
                       max(self.height() - 24 - legend_height, 30))
-        top = max((max(s.values) for s in series if s.values), default=0) or 1
+        top = max((n for s in series for n in map(_number, s.values)
+                   if n is not None), default=0) or 1
 
         rows = len(labels)
         row_height = min(plot.height() / max(rows, 1), float(self.MAX_ROW))
@@ -303,7 +318,9 @@ class HBarChart(ChartBase):
                              metrics.elidedText(str(label), Qt.TextElideMode.ElideRight,
                                                 int(label_width)))
             for si, item in enumerate(series):
-                value = item.values[ri] if ri < len(item.values) else 0
+                value = _number(item.values[ri]) if ri < len(item.values) else None
+                if value is None:                  # розрив: смуги немає
+                    continue
                 width = (value / top) * plot.width() if top else 0
                 rect = QRectF(plot.left(), y0 + si * bar_height, max(width, 1.0),
                               max(bar_height - 1, 2.0))
@@ -341,7 +358,10 @@ class PieChart(ChartBase):
         if not chart.series or not chart.series[0].values:
             return self._empty(painter)
         item = chart.series[0]
-        values = [max(v, 0) for v in item.values]
+        # Невідоме значення лишається на своєму місці нулем: інакше поїхала б
+        # відповідність між частками й підписами легенди.
+        values = [max(number, 0.0) if (number := _number(v)) is not None else 0.0
+                  for v in item.values]
         total = sum(values)
         if total <= 0:
             return self._empty(painter)
@@ -401,22 +421,29 @@ class PieChart(ChartBase):
 
 
 class LineChart(ChartBase):
-    """Лінії з маркерами — для динаміки по місяцях."""
+    """Лінії з маркерами — для динаміки по місяцях.
+
+    Значення ``None`` — не нуль, а «тут даних немає»: лінія розривається й
+    жодної точки не малюється. Саме на цьому тримається графік прогнозу,
+    де факт займає ліву половину осі, а прогноз із межами — праву.
+    """
 
     HEIGHT = 280
 
     def draw(self, painter: QPainter) -> None:
         chart = self.data
-        series = [s for s in chart.series if s.values]
+        series = [s for s in chart.series
+                  if any(_number(v) is not None for v in s.values)]
         if not series or not series[0].labels:
             return self._empty(painter)
-        labels = series[0].labels
+        labels = max((s.labels for s in series), key=len)
         metrics = self._small(painter, 9)
         legend_height = self._legend(painter, QRectF(self.rect()))
         plot = QRectF(64, 10 + legend_height, max(self.width() - 76, 40),
                       max(self.height() - 42 - legend_height, 40))
 
-        top = max((max(s.values) for s in series if s.values), default=0) or 1
+        known = [n for s in series for n in map(_number, s.values) if n is not None]
+        top = max(known, default=0) or 1
         step = _nice_step(top, whole=_is_whole(series))
         top = math.ceil(top / step) * step
         self._grid(painter, plot, top, step)
@@ -427,13 +454,19 @@ class LineChart(ChartBase):
         for si, item in enumerate(series):
             color = self.color(si)
             path = QPainterPath()
-            for i, value in enumerate(item.values):
+            started = False
+            for i, raw in enumerate(item.values):
+                value = _number(raw)
+                if value is None:
+                    started = False
+                    continue
                 x = plot.left() + i * dx
                 y = plot.bottom() - (value / top) * plot.height()
-                if i == 0:
-                    path.moveTo(x, y)
-                else:
+                if started:
                     path.lineTo(x, y)
+                else:
+                    path.moveTo(x, y)
+                    started = True
             painter.setBrush(Qt.BrushStyle.NoBrush)
             pen = QPen(color)
             pen.setWidthF(2.2)
@@ -443,7 +476,10 @@ class LineChart(ChartBase):
 
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(color)
-            for i, value in enumerate(item.values):
+            for i, raw in enumerate(item.values):
+                value = _number(raw)
+                if value is None:
+                    continue
                 x = plot.left() + i * dx
                 y = plot.bottom() - (value / top) * plot.height()
                 radius = 4.5 if len(self._hits) == self._hot else 3.2

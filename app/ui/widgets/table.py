@@ -15,25 +15,15 @@ from PySide6.QtWidgets import (
     QPushButton, QTableView, QVBoxLayout, QWidget,
 )
 
+from ...core.report import is_money_column as _is_money
+from ...core.report import is_percent_column as _is_percent
 from ...core.report import money, pct
 
-#: Слова в назві колонки, за якими число показується відсотком.
-PERCENT_WORDS = ("частка", "дисконт", "результативність", "розрив", "динаміка",
-                 "повторні", "без торгів", "економія", "охоплення")
 #: Скільки рядків узагалі віддаємо у віджет — далі таблиця стає некерованою,
 #: а повний зріз завжди є у вивантаженні в Excel.
 MAX_ROWS = 5000
 #: Скільки рядків Qt дозволено переглянути, добираючи ширину колонок.
 AUTOSIZE_ROWS = 120
-
-
-def _is_percent(header: str) -> bool:
-    low = str(header or "").lower()
-    return any(word in low for word in PERCENT_WORDS)
-
-
-def _is_money(header: str) -> bool:
-    return "грн" in str(header or "").lower()
 
 
 class SheetModel(QAbstractTableModel):

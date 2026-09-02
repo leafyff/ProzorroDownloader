@@ -226,10 +226,14 @@ class IndexBuilder:
                         tid = row.get("tenderID")
                         uuid = row.get("id")
                         if tid and uuid and (self.keep_all or (self.wanted and tid in self.wanted)):
-                            # Порожні колонки лишаються з часів, коли стрічку
-                            # тягнули з усіма полями; читається лише пара
-                            # tender_id → uuid.
-                            batch.append((tid, uuid, "", modified, "", "", "", "", ""))
+                            # Крім пари tender_id → uuid зі стрічки береться
+                            # тип процедури: ним добираються закупівлі, назву
+                            # процедури яких пошук порталу не приймає. Решта
+                            # колонок лишається порожньою з часів, коли стрічку
+                            # тягнули з усіма полями.
+                            batch.append((tid, uuid, "", modified, "",
+                                          row.get("procurementMethodType") or "",
+                                          "", "", ""))
                         count += 1
                         if modified and modified != last_day:
                             # Добу можна вважати покритою лише тоді, коли ми

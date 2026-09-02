@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 from datetime import datetime
-from pathlib import Path
 
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QCheckBox, QFileDialog, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton,
     QVBoxLayout, QWidget,
 )
+
+from ...paths import export_path
 
 LEVEL_MARK = {"info": "·", "warn": "!", "error": "×"}
 LEVEL_COLOR = {"info": "#98a1b2", "warn": "#f0b429", "error": "#ef5f5f"}
@@ -17,8 +18,11 @@ MAX_LINES = 5000
 
 
 class LogPage(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, get_output_dir=None, parent=None):
         super().__init__(parent)
+        # Теку беремо так само, як сторінки результатів і файлів, — щоб журнал
+        # лягав поруч із рештою зібраного, а не в домашню теку користувача.
+        self.get_output_dir = get_output_dir
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 20, 24, 20)
         root.setSpacing(12)
@@ -81,9 +85,10 @@ class LogPage(QWidget):
         self.view.clear()
 
     def save(self) -> None:
+        folder = self.get_output_dir() if self.get_output_dir else None
         path, _ = QFileDialog.getSaveFileName(
             self, "Зберегти журнал",
-            str(Path.home() / f"prozorro-журнал-{datetime.now():%Y%m%d-%H%M}.txt"),
+            str(export_path("prozorro-журнал", ".txt", folder=folder)),
             "Текстовий файл (*.txt)")
         if not path:
             return

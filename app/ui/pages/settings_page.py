@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 
 from ...config import COMPETITOR_COMPANIES, OWN_COMPANIES, Settings
 from ...core.db import Database
+from ...paths import default_output_dir
 from ..widgets.common import Card, DateRange, EdrpouList, wrapped_label
 
 RESOLVE_MODES = {
@@ -294,8 +295,9 @@ class SettingsPage(QWidget):
     # --- дії --------------------------------------------------------------
 
     def _pick_dir(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Тека для завантажень",
-                                                self.output_dir.text() or str(Path.home()))
+        path = QFileDialog.getExistingDirectory(
+            self, "Тека для завантажень",
+            self.output_dir.text().strip() or str(default_output_dir()))
         if path:
             self.output_dir.setText(path)
 

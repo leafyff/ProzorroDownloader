@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any, Sequence
 
 from ..config import METHOD_LABELS, STATUS_LABELS
+from . import rejections as rj
 from .db import Database
 from .extract import SCOPE_LABELS
 
@@ -21,8 +22,10 @@ SHEET_NOTES = {
     "Номенклатура": "Позиції закупівель: товар, код ДК021, кількість і ціна за одиницю. "
                     "Основа для аналізу товару та торгових марок.",
     "Пропозиції": "Хто подавався і з якою сумою. Видно лише там, де процедура розкриває пропозиції.",
-    "Переможці": "Рішення про визначення переможця.",
+    "Переможці": "Рішення про визначення переможця. Для відхилених — підстава, її категорія "
+                 "та пояснення замовника.",
     "Договори": "Укладені договори з ЄДРПОУ постачальника й сумою.",
+    "Відміни закупівель": "Закупівлі, які замовник відмінив: підстава з переліку та обґрунтування.",
     "Документи": "Реєстр усіх файлів закупівель: тип, чий файл, стан завантаження та шлях на диску.",
     "Товари каталогу": "Картки товарів Prozorro Market: бренд, штрихкод, ціновий діапазон, фото, повнота картки.",
     "Характеристики товарів": "Технічні параметри товарів у довгому форматі: товар × характеристика × значення.",
@@ -115,14 +118,43 @@ def bids(db: Database) -> Sheet:
 
 
 def awards(db: Database) -> Sheet:
+    """Рішення про переможця — разом із підставою, якщо переможця відхилили.
+
+    Категорію дописуємо тут заради зведених таблиць користувача; аналітика
+    її не читає, а класифікує текст сама, щоб зміна довідника причин діяла й
+    на вже вивантажених книгах.
+    """
     headers = ["Номер закупівлі", "Дата закупівлі", "Переможець", "ЄДРПОУ переможця",
-               "Сума", "Валюта", "Статус рішення", "Дата рішення"]
-    rows = [[r["tender_id"], (r["date_created"] or "")[:10], r["supplier_name"],
-             r["supplier_edrpou"], r["value_amount"], r["currency"], r["status"],
-             (r["date"] or "")[:10]]
+               "Сума", "Валюта", "Статус рішення", "Дата рішення",
+               "Причина відмови", "Категорія причини", "Пояснення відмови"]
+    rows = []
+    for r in db.query("""
+            SELECT t.tender_id, t.date_created, a.* FROM awards a
+            JOIN tenders t ON t.uuid = a.tender_uuid
+            ORDER BY t.date_created DESC"""):
+        rejected = rj.is_rejected(r["status"])
+        reason = (r["reason"] or "") if rejected else ""
+        explanation = (r["explanation"] or "") if rejected else ""
+        rows.append([
+            r["tender_id"], (r["date_created"] or "")[:10], r["supplier_name"],
+            r["supplier_edrpou"], r["value_amount"], r["currency"], r["status"],
+            (r["date"] or "")[:10],
+            reason, rj.classify(reason, explanation) if rejected else "", explanation,
+        ])
+    return headers, rows
+
+
+def cancellations(db: Database) -> Sheet:
+    headers = ["Номер закупівлі", "Дата закупівлі", "Замовник", "ЄДРПОУ замовника",
+               "Очікувана вартість", "Дата відміни", "Статус відміни",
+               "Підстава відміни", "Код підстави", "Обґрунтування", "Лот"]
+    rows = [[r["tender_id"], (r["date_created"] or "")[:10], r["pe_name"], r["pe_edrpou"],
+             r["value_amount"], (r["date"] or "")[:10], r["status"],
+             rj.cancel_label(r["reason_type"]), r["reason_type"], r["reason"], r["lot_id"]]
             for r in db.query("""
-                SELECT t.tender_id, t.date_created, a.* FROM awards a
-                JOIN tenders t ON t.uuid = a.tender_uuid
+                SELECT t.tender_id, t.date_created, t.pe_name, t.pe_edrpou, t.value_amount, c.*
+                FROM cancellations c
+                JOIN tenders t ON t.uuid = c.tender_uuid
                 ORDER BY t.date_created DESC""")]
     return headers, rows
 
@@ -196,6 +228,7 @@ BUILDERS = {
     "Пропозиції": bids,
     "Переможці": awards,
     "Договори": contracts,
+    "Відміни закупівель": cancellations,
     "Документи": documents,
     "Товари каталогу": products,
     "Характеристики товарів": product_specs,

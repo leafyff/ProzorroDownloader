@@ -17,6 +17,40 @@ Sheet = tuple[list[str], list[list[Any]]]
 #: Текст, яким аналіз чесно зізнається, що далі потрібна не арифметика.
 NEEDS_AI = "Потрібний глибший ШІ аналіз"
 
+#: Кольори рядів графіка. Порядок підібраний так, щоб сусідні ряди різнилися і
+#: за тоном, і за яскравістю — графік лишається читабельним і в чорно-білому
+#: друці. Палітра живе тут, а не у віджеті, бо ті самі кольори беруть і
+#: намальовані на QPainter графіки, і діаграми в книзі Excel: розійшовшись,
+#: вони показували б один ряд різними кольорами на екрані й у звіті.
+SERIES_COLORS = [
+    "#3d7eff", "#3ecf8e", "#f0b429", "#a78bfa", "#22d3ee",
+    "#fb923c", "#f472b6", "#84cc16", "#e879f9", "#94a3b8",
+]
+#: Колір для виділених значень — наші ТОВ у рейтингах.
+OWN_COLOR = "#3ecf8e"
+#: Колір викидів у точковій хмарі.
+OUTLIER_COLOR = "#ef5f5f"
+
+#: Слова в назві колонки, за якими число показується відсотком.
+PERCENT_WORDS = ("частка", "дисконт", "результативність", "розрив", "динаміка",
+                 "повторні", "без торгів", "економія", "охоплення")
+
+
+def is_percent_column(header: str) -> bool:
+    """Чи ця колонка — частка (0…1), яку показують відсотком.
+
+    Тип колонки визначається за назвою, а не за значеннями: 0,25 у колонці
+    «Частка» — це 25%, а в колонці «Розрив» — теж, а от у «Позицій» — ні.
+    Правило спільне для таблиці на екрані й для формату клітинки в книзі,
+    інакше та сама колонка читалася б по-різному.
+    """
+    low = str(header or "").lower()
+    return any(word in low for word in PERCENT_WORDS)
+
+
+def is_money_column(header: str) -> bool:
+    return "грн" in str(header or "").lower()
+
 
 # --- статистика -----------------------------------------------------------
 
@@ -88,9 +122,18 @@ def robust_z(values: Sequence[float]) -> list[float]:
 
     Якщо MAD нульовий (половина значень однакові), масштаб беремо з
     міжквартильного розмаху. А якщо нульовий і він — понад три чверті значень
-    збігаються, — лишається звичайне стандартне відхилення: у такому ряду
-    навіть одне інше число вже помітне, і мовчки пропускати його не можна.
+    збігаються, — лишається звичайне стандартне відхилення.
     Коли ж усі значення однакові, розкиду немає взагалі.
+
+    **Межа останнього запасного масштабу.** Самотній викид роздуває те саме
+    стандартне відхилення, яким його міряють: у ряду з ``n`` однакових значень
+    і одного іншого показник дорівнює рівно ``√n`` — незалежно від того,
+    наскільки те число інше. Тож при :data:`app.core.insight.Z_OUTLIER` = 3,5
+    одинокий викид помітний лише з 13 значень, а в найменшій групі
+    (``MIN_GROUP`` = 8) не перетне поріг ніколи. Це властивість масштабу, а не
+    недогляд: пропустити викид тут безпечніше, ніж вилучити з аналізу
+    справжній товар, а на групах із двома й більше несхожими значеннями MAD
+    або міжквартильний розмах уже не нульові й працюють нормально.
     """
     data = clean(values)
     if len(data) < 4:
@@ -168,10 +211,16 @@ def money(value: Any, digits: int = 0) -> str:
 
 
 def compact(value: Any) -> str:
-    """Коротка сума для плиток: ``12 345 678`` → ``12,3 млн``."""
+    """Коротка сума для плиток: ``12 345 678`` → ``12,3 млн``.
+
+    Нескінченність і NaN відсіюємо так само, як :func:`money`: ділення на нуль
+    десь у рушії не має перетворюватись на плитку «inf млрд».
+    """
     try:
         number = float(value)
     except (TypeError, ValueError):
+        return "—"
+    if not math.isfinite(number):
         return "—"
     for limit, suffix in ((1e9, " млрд"), (1e6, " млн"), (1e3, " тис.")):
         if abs(number) >= limit:
@@ -192,6 +241,21 @@ def count(value: Any) -> str:
         return f"{int(value):,}".replace(",", " ")
     except (TypeError, ValueError):
         return "—"
+
+
+def plural(number: int, one: str, few: str, many: str) -> str:
+    """Форма іменника за числом: «1 раз», «2 рази», «5 разів».
+
+    Українська рахує трьома формами, і число у висновку майже завжди
+    підставляється з даних — тобто «зачепило 1 разів» вийде рано чи пізно.
+    Винятком є другий десяток: 11-14 беруть множину попри останню цифру.
+    """
+    if 11 <= number % 100 <= 14:
+        return many
+    tail = number % 10
+    if tail == 1:
+        return one
+    return few if 2 <= tail <= 4 else many
 
 
 # --- складники звіту ------------------------------------------------------
@@ -254,6 +318,9 @@ class Profile:
     top_brand: str = ""
     top_brand_share: float = 0.0
     brands: list[tuple[str, int]] = field(default_factory=list)
+    #: ТМ лише з виграних закупівель — на відміну від ``brands``, куди входять
+    #: і програні подання. Потрібні там, де питання саме про проданий товар.
+    sold_brands: list[tuple[str, int]] = field(default_factory=list)
     main_product: str = ""
     top_region: str = ""
     discount: float | None = None
@@ -262,6 +329,14 @@ class Profile:
     reporting_share: float = 0.0
     certificates: int = 0
     authorizations: int = 0
+    #: Скасовані перемоги: рішення про переможця, які замовник відхилив.
+    #: Це не те саме, що програш — компанія вже виграла, і договір зірвався
+    #: після цього.
+    n_rejected: int = 0
+    rejected_sum: float = 0.0
+    #: Найчастіша причина відмов і частка зривів серед усіх перемог компанії.
+    reject_reason: str = ""
+    reject_share: float | None = None
     first_seen: str = ""
     last_seen: str = ""
     traits: list[str] = field(default_factory=list)
@@ -287,49 +362,3 @@ class Report:
 
     def add(self, section: str, block: Block) -> None:
         self.sections.setdefault(section, []).append(block)
-
-    def sheets(self) -> dict[str, Sheet]:
-        """Усі таблиці звіту для вивантаження. Назви аркушів — унікальні.
-
-        Таблиці профілів не розкладаються по аркушу на компанію — двадцять
-        гравців дали б сотню аркушів, у яких нічого не знайти. Однойменні
-        таблиці зводяться в одну, а компанія стає першими двома колонками:
-        такий аркуш зручно крутити зведеною таблицею.
-        """
-        out: dict[str, Sheet] = {}
-        used: set[str] = set()
-
-        def put(name: str, sheet: Sheet) -> None:
-            base = (name or "Таблиця")[:31]
-            title = base
-            n = 2
-            while title.lower() in used:
-                suffix = f" {n}"
-                title = base[:31 - len(suffix)] + suffix
-                n += 1
-            used.add(title.lower())
-            out[title] = sheet
-
-        for blocks in self.sections.values():
-            for block in blocks:
-                for name, sheet in block.tables:
-                    if sheet and sheet[1]:
-                        put(name, sheet)
-
-        merged: dict[tuple[str, tuple], list[list[Any]]] = {}
-        order: list[tuple[str, tuple]] = []
-        for profile in [*self.ours, *self.competitors]:
-            if not profile.block:
-                continue
-            for name, (headers, rows) in profile.block.tables:
-                if not rows:
-                    continue
-                key = (name, tuple(headers))
-                if key not in merged:
-                    merged[key] = []
-                    order.append(key)
-                merged[key].extend([profile.edrpou, profile.name, *row] for row in rows)
-        for key in order:
-            name, headers = key
-            put(f"{name} — гравці", (["ЄДРПОУ", "Компанія", *headers], merged[key]))
-        return out

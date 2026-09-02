@@ -57,7 +57,7 @@ class MainWindow(QMainWindow):
         self.results_page = ResultsPage(db, lambda: self.s.output_dir)
         self.analytics_page = AnalyticsPage(settings)
         self.files_page = FilesPage(db, lambda: self.s.output_dir)
-        self.log_page = LogPage()
+        self.log_page = LogPage(lambda: self.s.output_dir)
         self.settings_page = SettingsPage(settings, db)
         # Порядок сторінок має збігатися з NAV — кнопка перемикає стек за індексом.
         for page in (self.search_page, self.results_page, self.analytics_page,

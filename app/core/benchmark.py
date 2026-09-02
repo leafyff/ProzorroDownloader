@@ -15,7 +15,7 @@ from . import brands as tm
 from .players import MIN_FACTS, TOP_RIVALS
 from .report import (
     Block, ChartData, NEEDS_AI, Profile, Series, Sheet,
-    compact, count, median, money, pct, share,
+    compact, count, median, money, pct, plural, share,
 )
 
 
@@ -85,14 +85,27 @@ class BenchmarkMixin:
         if matrix[1]:
             block.tables.append(("ТМ по компаніях", matrix))
 
-        types = self._product_types()
-        if types[1]:
-            block.tables.append(("Товари ринку", types))
-            top = types[1][:TOP_RIVALS]
+        # Дві таблиці одного й того самого: об'єднана відповідає «скільки
+        # насправді купують мишей», а друга показує кожне формулювання окремо —
+        # нею й перевіряють, чи правильно об'єднано.
+        grouped = self._product_types(grouped=True)
+        if grouped[1]:
+            block.tables.append(("Товари ринку (об'єднані)", grouped))
+            top = grouped[1][:TOP_RIVALS]
             block.charts.append(ChartData(
                 "Найпоширеніші товари", "hbar",
                 [Series("Позицій", [r[0][:34] for r in top], [r[1] for r in top])],
-                unit="шт", money_axis=False))
+                unit="шт", money_axis=False,
+                hint="Однакові товари з різними формулюваннями зведені в один рядок: "
+                     "«Миші», «Мишка» й «Миша дротова» — це «Миша». Колонка «Варіанти "
+                     "назви» в таблиці показує, що саме злилося."))
+        raw = self._product_types()
+        if raw[1]:
+            block.tables.append(("Товари ринку (як у документах)", raw))
+            block.notes.append(
+                f"Назви товарів об'єднано в родові типи: {len(raw[1])} різних "
+                f"формулювань з документів дали {len(grouped[1])} товарів. Обидві "
+                f"таблиці нижче — та сама номенклатура, різниця лише в об'єднанні.")
 
         catalog = self._catalog_block()
         if catalog:
@@ -116,7 +129,7 @@ class BenchmarkMixin:
                 "або описи позицій не містять назв марок. " + NEEDS_AI +
                 " за змістом тендерної документації.")
         self.report.add("Товари і ТМ", block)
-        self._step("Товари й ТМ пораховано", 5)
+        self._step("Товари й ТМ пораховано", 6)
 
     def _brand_matrix(self, brand_companies: dict[str, Counter]) -> Sheet:
         totals = {name: sum(players.values()) for name, players in brand_companies.items()}
@@ -139,11 +152,20 @@ class BenchmarkMixin:
             rows.append(line)
         return headers, rows
 
-    def _product_types(self) -> Sheet:
+    def _product_types(self, grouped: bool = False) -> Sheet:
+        """Товари ринку — або об'єднані в родові типи, або як у документах.
+
+        Дві таблиці замість однієї, бо вони відповідають на різні питання.
+        Об'єднана каже, скільки насправді купують мишей; «як у документах»
+        лишає кожне формулювання окремим рядком — це потрібно, щоб перевірити
+        саме об'єднання й побачити, як замовник назвав предмет.
+        """
         cells: dict[str, dict] = defaultdict(
-            lambda: {"items": 0, "tenders": set(), "qty": 0.0, "prices": [], "brands": Counter()})
+            lambda: {"items": 0, "tenders": set(), "qty": 0.0, "prices": [],
+                     "brands": Counter(), "names": Counter()})
         for item in self.clean_items:
-            kind = self._product_type(item["description"])
+            kind = (self._product_group(item["description"]) if grouped
+                    else self._product_type(item["description"]))
             if not kind:
                 continue
             cell = cells[kind]
@@ -153,8 +175,14 @@ class BenchmarkMixin:
             if item["unit_price"]:
                 cell["prices"].append(item["unit_price"])
             cell["brands"].update(self._brands_of(item["description"]))
+            if grouped:
+                name = self._product_type(item["description"])
+                if name:
+                    cell["names"][name] += 1
         headers = ["Товар", "Позицій", "Закупівель", "Кількість", "Медіанна ціна, грн",
                    "Мін. ціна, грн", "Макс. ціна, грн", "Головні ТМ"]
+        if grouped:
+            headers.append("Варіанти назви")
         rows = []
         for kind, cell in sorted(cells.items(), key=lambda kv: -kv[1]["items"]):
             prices = cell["prices"]
@@ -163,6 +191,11 @@ class BenchmarkMixin:
                          round(min(prices), 2) if prices else None,
                          round(max(prices), 2) if prices else None,
                          ", ".join(f"{b} ({n})" for b, n in cell["brands"].most_common(3))])
+            if grouped:
+                # Показуємо, що саме злилося: об'єднання має бути перевірним,
+                # а не мовчазним.
+                rows[-1].append(", ".join(f"{name} ({n})"
+                                          for name, n in cell["names"].most_common(8)))
         return headers, rows
 
     def _catalog_block(self) -> dict | None:
@@ -304,7 +337,7 @@ class BenchmarkMixin:
             "зв'язки «ТМ → дистриб'ютор» можна внести у data/brands.json — "
             "аналіз почне їх показувати.")
         self.report.add("Постачання", block)
-        self._step("Канали постачання оцінено", 6)
+        self._step("Канали постачання оцінено", 7)
 
     def _supply_verdict(self, profile: Profile, exclusive: list[str], own_marks: list[str],
                         vendors: Counter, known: list[str]) -> str:
@@ -342,7 +375,8 @@ class BenchmarkMixin:
             profile.strengths, profile.weaknesses = self._sides(profile, market)
 
         headers = ["ЄДРПОУ", "Компанія", "Наша", "Основна ТМ", "Частка основної ТМ",
-                   "ТМ у портфелі", "Власна ТМ", "Сертифікатів", "Авторизацій",
+                   "ТМ у портфелі", "З них продано ТМ", "Власна ТМ",
+                   "Сертифікатів", "Авторизацій",
                    "Результативність", "Дисконт", "Областей", "Замовників",
                    "Повторні замовники", "Сильні сторони", "Слабкі сторони",
                    "Що не виводиться з цифр"]
@@ -350,7 +384,8 @@ class BenchmarkMixin:
         for profile in everyone:
             rows.append([
                 profile.edrpou, profile.name, "так" if profile.is_ours else "",
-                profile.top_brand, round(profile.top_brand_share, 4), len(profile.brands),
+                profile.top_brand, round(profile.top_brand_share, 4),
+                len(profile.brands), len(profile.sold_brands),
                 (tm.own_tm().get(profile.top_brand) or {}).get("owner", ""),
                 profile.certificates, profile.authorizations,
                 round(profile.win_rate, 4) if profile.win_rate is not None else None,
@@ -371,9 +406,14 @@ class BenchmarkMixin:
             labels = [self._short_name(p.edrpou, 30) for p in line]
             accent = set(range(len(ours)))
             block.charts.append(ChartData(
-                "Ширина портфеля ТМ", "hbar",
-                [Series("ТМ у портфелі", labels, [len(p.brands) for p in line],
-                        accent=accent)], unit="шт", money_axis=False))
+                "Кількість різних товарних марок, проданих компанією"
+                + self._period_words(), "hbar",
+                [Series("Різних ТМ", labels, [len(p.sold_brands) for p in line],
+                        accent=accent)], unit="шт", money_axis=False,
+                hint="Рахуються ТМ із виграних закупівель, а не з усіх подань: те, що "
+                     "гравець пропонував і програв, він не продав. ТМ визначається за "
+                     "описом позиції, тож закупівля, де марку не назвали, сюди не "
+                     "потрапляє. Наші ТОВ виділені кольором."))
             block.charts.append(ChartData(
                 "Цінова поведінка: медіанний дисконт", "hbar",
                 [Series("Дисконт", labels, [(p.discount or 0) * 100 for p in line],
@@ -394,8 +434,34 @@ class BenchmarkMixin:
             "та зовнішніми джерелами.")
         if not self.own:
             block.notes.append("Наші ЄДРПОУ не задані — порівняння показує лише конкурентів.")
+        else:
+            silent = [p for p in self.report.ours if p.signed <= 0 and p.n_bids == 0]
+            if silent:
+                block.notes.append(
+                    "На графіках немає " + ", ".join(p.label for p in silent)
+                    + ": у цій вибірці за цими ЄДРПОУ немає ані угод, ані пропозицій, "
+                    "тож порівнювати нічого. Це не «нуль на ринку», а відсутність "
+                    "даних — перевірте період і фільтр ДК021.")
         self.report.add("Порівняння", block)
-        self._step("Порівняння складено", 7)
+        self._step("Порівняння складено", 8)
+
+    def _period_words(self) -> str:
+        """Хвіст заголовка з періодом вибірки: «з 01.01.2025 до 31.12.2025».
+
+        Повертається з провідним пробілом, щоб приклеюватися до назви графіка.
+
+        Заголовок читається як речення, тож дати тут у звичному «дд.мм.рррр»,
+        а не в ISO, як у плитці «Період». Порожній період дає порожній рядок —
+        заголовок просто лишається без хвоста.
+        """
+        first, last = self.report.period
+        if not first or not last:
+            return ""
+
+        def day(iso: str) -> str:
+            return ".".join(reversed(iso.split("-")))
+
+        return f" з {day(first)} до {day(last)}"
 
     def _sides(self, profile: Profile, market: dict) -> tuple[list[str], list[str]]:
         strong: list[str] = []
@@ -509,21 +575,36 @@ class BenchmarkMixin:
                 for chart in other.charts[:2]:
                     block.charts.append(chart)
         self.report.add("Підсумок", block)
-        self._step("Звіт зібрано", 8)
+        self._step("Звіт зібрано", 10)
 
     def _loss_summary(self) -> str:
         if not self.own:
             return ""
         absent = price = other = 0
+        #: Причини саме тих поразок, що потрапили в цей підрахунок. Брати їх
+        #: з усіх наших відмов не можна: там і закупівлі, яких немає в цьому
+        #: переліку, — вийшло б «4 перемоги: відмова від договору — 11».
+        rejected: Counter[str] = Counter()
+        mark = "нас відхилили: "
         for profile in self.report.competitors:
             _h, rows = self._loss_table(profile.edrpou)
             absent += sum(1 for r in rows if r[7] == "ми не подавалися")
             price += sum(1 for r in rows if r[7] == "програли за ціною")
             other += sum(1 for r in rows if r[7].startswith("ціна була нижча"))
-        total = absent + price + other
+            rejected.update(r[7][len(mark):] for r in rows if r[7].startswith(mark))
+        total = absent + price + other + sum(rejected.values())
         if not total:
             return ""
-        return (f"З {total} закупівель, які взяли розібрані конкуренти, у {absent} "
+        text = (f"З {total} закупівель, які взяли розібрані конкуренти, у {absent} "
                 f"({pct(share(absent, total))}) нас навіть не було на подачі, у {price} "
-                f"нас перебили ціною, а в {other} наша ціна була нижчою — і закупівля "
-                f"все одно пішла не до нас (відхилення чи невідповідність вимогам).")
+                f"нас перебили ціною")
+        if other:
+            text += (f", а в {other} наша ціна була нижчою — і закупівля все одно "
+                     f"пішла не до нас, хоч підстави замовник і не назвав")
+        if rejected:
+            # Тут уже не здогад: підставу назвав сам замовник.
+            n = sum(rejected.values())
+            text += (f". Ще {n} {plural(n, 'перемогу', 'перемоги', 'перемог')} "
+                     f"ми втратили після відхилення: "
+                     + "; ".join(f"{name} — {k}" for name, k in rejected.most_common(3)))
+        return text + "."

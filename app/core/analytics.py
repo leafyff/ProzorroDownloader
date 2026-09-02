@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any, Sequence
 
+from . import rejections as rj
 from .classifiers import cpv_name, significant_prefix
 from .db import Database
 
@@ -244,6 +245,71 @@ def participants(db: Database) -> Sheet:
     return headers, out
 
 
+def _rejected_awards(db: Database) -> list[dict]:
+    """Відхилені рішення про переможця з розпізнаною причиною.
+
+    Тільки ``unsuccessful``: скасоване рішення — це та сама подія вдруге
+    (див. :mod:`app.core.rejections`).
+    """
+    rows = []
+    for row in db.query("""
+            SELECT a.supplier_edrpou AS edrpou, a.supplier_name AS name,
+                   a.value_amount AS amount, a.reason, a.explanation,
+                   t.pe_edrpou AS buyer_edrpou, t.pe_name AS buyer
+            FROM awards a JOIN tenders t ON t.uuid = a.tender_uuid
+            WHERE a.status = ?""", (rj.REJECTED_STATUS,)):
+        cell = dict(row)
+        cell["category"] = rj.classify(cell["reason"] or "", cell["explanation"] or "")
+        rows.append(cell)
+    return rows
+
+
+def rejection_reasons(db: Database) -> Sheet:
+    """Чому перемоги не стають договорами."""
+    rows = _rejected_awards(db)
+    agg: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"n": 0, "amount": 0.0, "firms": set(), "buyers": set()})
+    for row in rows:
+        cell = agg[row["category"]]
+        cell["n"] += 1
+        cell["amount"] += _money(row["amount"])
+        cell["firms"].add(row["edrpou"])
+        cell["buyers"].add(row["buyer_edrpou"])
+    headers = ["Причина", "Випадків", "Частка", "Сума, грн", "Компаній", "Замовників"]
+    return headers, [[
+        name, cell["n"], f"{cell['n'] / len(rows):.0%}" if rows else "—",
+        round(cell["amount"], 2), len(cell["firms"]), len(cell["buyers"]),
+    ] for name, cell in sorted(agg.items(), key=lambda kv: -kv[1]["n"])]
+
+
+def rejected_players(db: Database) -> Sheet:
+    """Хто втрачає перемоги після того, як уже виграв."""
+    rows = _rejected_awards(db)
+    won = {r["edrpou"]: r["n"] for r in db.query(
+        "SELECT supplier_edrpou AS edrpou, COUNT(DISTINCT tender_uuid) AS n"
+        " FROM awards WHERE status = 'active' AND supplier_edrpou <> ''"
+        " GROUP BY supplier_edrpou")}
+    agg: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"name": "", "n": 0, "amount": 0.0, "reasons": defaultdict(int)})
+    for row in rows:
+        cell = agg[row["edrpou"]]
+        cell["name"] = cell["name"] or row["name"]
+        cell["n"] += 1
+        cell["amount"] += _money(row["amount"])
+        cell["reasons"][row["category"]] += 1
+    headers = ["ЄДРПОУ", "Компанія", "Скасовано перемог", "Виграно закупівель",
+               "Частка зривів", "Сума, грн", "Головна причина"]
+    out = []
+    for edrpou, cell in sorted(agg.items(), key=lambda kv: -kv[1]["n"]):
+        wins = won.get(edrpou, 0)
+        attempts = wins + cell["n"]
+        top = sorted(cell["reasons"].items(), key=lambda kv: -kv[1])[0][0]
+        out.append([edrpou, cell["name"], cell["n"], wins,
+                    f"{cell['n'] / attempts:.0%}" if attempts else "—",
+                    round(cell["amount"], 2), top])
+    return headers, out
+
+
 def overview(db: Database) -> Sheet:
     """Короткий підсумок вибірки."""
     marks = ",".join("?" * len(LIVE_CONTRACTS))
@@ -273,6 +339,10 @@ def overview(db: Database) -> Sheet:
     ]
 
 
+#: Аркуші, які створюються навіть порожніми: підсумок вибірки має бути
+#: завжди, інакше книга без жодного договору виявилася б зовсім порожньою.
+ALWAYS = ("Підсумок",)
+
 #: Порядок аркушів у книзі.
 SHEETS = {
     "Підсумок": overview,
@@ -281,8 +351,13 @@ SHEETS = {
     "Галузі ДК021": industries,
     "По місяцях": monthly,
     "Учасники торгів": participants,
+    "Причини відмов": rejection_reasons,
+    "Скасовані перемоги": rejected_players,
 }
 
 
 def build_sheets(db: Database) -> dict[str, Sheet]:
-    return {name: builder(db) for name, builder in SHEETS.items()}
+    # Порожній аркуш у зведенні — це питання «а де ж дані?», тож розділи,
+    # яких у вибірці немає (скажімо, жодної відмови), просто не створюються.
+    built = ((name, builder(db)) for name, builder in SHEETS.items())
+    return {name: sheet for name, sheet in built if sheet[1] or name in ALWAYS}

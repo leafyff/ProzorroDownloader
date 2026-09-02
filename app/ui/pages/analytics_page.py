@@ -18,10 +18,11 @@ from PySide6.QtWidgets import (
 )
 
 from ...config import Settings
-from ...core.exporter import write_xlsx
+from ...core.forecast import DEFAULT_HORIZON
 from ...core.report import Block, ChartData, Profile, Report
+from ...core.reportbook import write_profile_report, write_report
 from ...core.xlsxload import find_workbooks
-from ...paths import export_path
+from ...paths import export_path, safe_name
 from ..widgets.charts import ChartBase, build as build_chart
 from ..widgets.common import Card, StatTile, wrapped_label
 from ..widgets.table import DataTable
@@ -154,6 +155,15 @@ class AnalyticsPage(QWidget):
         self.top_competitors.setRange(3, 60)
         self.top_competitors.setValue(20)
         options.addWidget(self.top_competitors)
+        options.addWidget(QLabel("Прогноз, місяців:"))
+        self.horizon = QSpinBox()
+        self.horizon.setRange(1, 12)
+        self.horizon.setValue(DEFAULT_HORIZON)
+        self.horizon.setToolTip(
+            "На скільки місяців уперед рахувати розділ «Прогнозування».\n"
+            "Що далі горизонт, то ширші межі: на шести місяцях історії\n"
+            "четвертий місяць уперед уже нічим не підтверджений.")
+        options.addWidget(self.horizon)
         options.addStretch(1)
         self.btn_run = QPushButton("Аналізувати")
         self.btn_run.setObjectName("Primary")
@@ -224,7 +234,8 @@ class AnalyticsPage(QWidget):
         self.progress.setRange(0, 0)
         self.progress.setFormat("Читаємо файл…")
         worker = AnalysisWorker(path, self.s, self.drop_outliers.isChecked(),
-                                self.top_competitors.value(), self)
+                                self.top_competitors.value(),
+                                self.horizon.value(), self)
         worker.progress.connect(self._on_progress)
         worker.finished_job.connect(self._on_finished)
         self.worker = worker
@@ -382,9 +393,10 @@ class AnalyticsPage(QWidget):
         lay = QVBoxLayout(holder)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
-        title = QLabel(chart.title)
-        title.setObjectName("SectionTitle")
-        lay.addWidget(title)
+        # Заголовки тут описові («Кількість різних товарних марок, проданих…»),
+        # тож переносяться: звичайний QLabel вимагав би ширину під цілий рядок
+        # і розтягував колонку сітки.
+        lay.addWidget(wrapped_label(chart.title, "SectionTitle"))
         if chart.hint:
             lay.addWidget(wrapped_label(chart.hint))
         lay.addWidget(build_chart(chart, self.s.theme), 1)
@@ -425,6 +437,19 @@ class AnalyticsPage(QWidget):
         lay = QVBoxLayout(holder)
         lay.setContentsMargins(2, 2, 12, 2)
         lay.setSpacing(12)
+        # Кнопка стоїть на самій сторінці компанії, а не внизу вікна: так
+        # видно, по кому саме буде звіт, і не треба пояснювати, що
+        # вивантажиться «поточний» гравець.
+        head = QHBoxLayout()
+        name = QLabel(profile.label)
+        name.setObjectName("SectionTitle")
+        head.addWidget(name, 1)
+        save = QPushButton("Зберегти звіт по компанії")
+        save.setToolTip("Окрема книга Excel: показники, висновки, таблиці й "
+                        "діаграми лише цієї компанії.")
+        save.clicked.connect(lambda _checked=False, p=profile: self.export_profile(p))
+        head.addWidget(save)
+        lay.addLayout(head)
         if profile.block:
             for widget in self._render_block(profile.block):
                 lay.addWidget(widget)
@@ -449,27 +474,53 @@ class AnalyticsPage(QWidget):
             chart.set_theme(self.s.theme)
 
     def export(self) -> None:
+        """Уся книга: розділи звіту й портрет кожного гравця."""
         if not self.report:
             return
+        if not self.report.sections:
+            QMessageBox.information(self, "Немає звіту", "У звіті немає жодного розділу.")
+            return
+        path = self._ask_path("Зберегти звіт аналітики", "prozorro-аналітика")
+        if path:
+            self._write(path, lambda: write_report(path, self.report),
+                        "Книга повторює звіт на екрані: аркуш на кожен розділ і на "
+                        "кожного гравця, у кожному — показники, висновки, таблиці "
+                        "та діаграми праворуч від своїх даних. Перелік аркушів — "
+                        "на першому аркуші «Зміст».")
+
+    def export_profile(self, profile: Profile) -> None:
+        """Звіт по одній компанії — нашій або конкуренту."""
+        if not self.report or not profile.block:
+            return
+        name = profile.name or profile.edrpou
+        path = self._ask_path(f"Зберегти звіт по компанії: {name[:60]}",
+                              f"prozorro-{safe_name(name, 32)}-{profile.edrpou}")
+        if path:
+            self._write(path, lambda: write_profile_report(path, self.report, profile),
+                        f"Книга з одного аркуша — усе, що звіт знає про «{name[:60]}»: "
+                        "показники, висновки, сильні та слабкі сторони, таблиці й "
+                        "діаграми праворуч від своїх даних.")
+
+    def _ask_path(self, title: str, stem: str) -> Path | None:
+        """Куди зберегти. Типово — тека вивантаження з налаштувань."""
         path, _ = QFileDialog.getSaveFileName(
-            self, "Зберегти звіт аналітики",
-            str(export_path("prozorro-аналітика", folder=self.s.output_dir)),
+            self, title, str(export_path(stem, folder=self.s.output_dir)),
             "Книга Excel (*.xlsx)")
-        if not path:
-            return
-        sheets = self.report.sheets()
-        if not sheets:
-            QMessageBox.information(self, "Немає таблиць", "У звіті немає жодної таблиці.")
-            return
+        return Path(path) if path else None
+
+    def _write(self, path: Path, write: Callable[[], Path], done: str) -> None:
+        # Книга на сорок тисяч закупівель пишеться секунд десять, і все це
+        # відбувається в потоці інтерфейсу — принаймні курсор має сказати,
+        # що вікно не зависло.
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            write_xlsx(Path(path), sheets)
+            write()
         except Exception as exc:
             QMessageBox.critical(self, "Помилка", f"Не вдалося зберегти файл:\n{exc}")
             return
-        listing = "\n".join(f"  · {name} — {len(rows):,} рядків".replace(",", " ")
-                            for name, (_h, rows) in list(sheets.items())[:24])
-        QMessageBox.information(self, "Готово",
-                                f"Збережено:\n{path}\n\nАркушів: {len(sheets)}\n{listing}")
+        finally:
+            QApplication.restoreOverrideCursor()
+        QMessageBox.information(self, "Готово", f"Збережено:\n{path}\n\n{done}")
 
     def stop(self) -> None:
         """Просить робочий потік зупинитись і чекає на нього перед виходом."""

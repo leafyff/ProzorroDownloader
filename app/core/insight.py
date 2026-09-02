@@ -25,13 +25,17 @@ import threading
 from collections import Counter, defaultdict
 from datetime import datetime
 from functools import lru_cache
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Sequence
 
 from ..config import KNOWN_COMPANIES
 from . import brands as tm
 from .classifiers import by_prefix, cpv_name
+from .products import product_group
 from .benchmark import BenchmarkMixin
+from .forecast import DEFAULT_HORIZON
+from .outlook import OutlookMixin
 from .players import PlayersMixin
+from .rejections import RejectionMixin
 from .report import (
     Block, ChartData, Report, Series, Sheet,
     compact, count, gini, hhi, hhi_verdict, median, median_of, money, pct,
@@ -53,6 +57,11 @@ LIVE_AWARDS = ("active",)
 TOP_COMPETITORS = 20
 #: Скільки позицій показуємо у рейтингах і колових діаграмах.
 TOP_ROWS = 15
+#: Скільки кроків має повний аналіз. Смуга поступу на сторінці аналітики
+#: склеює його з читанням книги, тож число має бути одне на обидва боки —
+#: інакше відсоток стрибає, щойно з'явиться новий крок або новий аркуш.
+ANALYSIS_STEPS = 10
+
 #: Поріг стійкого z-показника, за яким значення вважається викидом.
 Z_OUTLIER = 3.5
 #: Менші групи для порівняння сум занадто дрібні — беремо загальний розподіл.
@@ -195,16 +204,18 @@ def product_type(text: str) -> str:
     return name[:1].upper() + name[1:].lower() if name else ""
 
 
-class Analyzer(PlayersMixin, BenchmarkMixin):
+class Analyzer(PlayersMixin, BenchmarkMixin, OutlookMixin, RejectionMixin):
     """Один прохід аналізу над однією книгою."""
 
     def __init__(self, data: Dataset, own_edrpou: Iterable[str] = (),
                  tracked: Iterable[str] = (), drop_outliers: bool = True,
                  top_competitors: int = TOP_COMPETITORS,
                  on_progress: Callable[[str, int, int], None] | None = None,
-                 cancel_event: "threading.Event | None" = None):
+                 cancel_event: "threading.Event | None" = None,
+                 horizon: int = DEFAULT_HORIZON):
         self.data = data
         self.cancel_event = cancel_event
+        self.horizon = max(1, int(horizon))
         self.own = {str(code).strip() for code in own_edrpou if str(code).strip()}
         self.tracked = {str(code).strip() for code in tracked if str(code).strip()}
         self.drop_outliers = drop_outliers
@@ -214,12 +225,13 @@ class Analyzer(PlayersMixin, BenchmarkMixin):
                              generated=datetime.now().strftime("%d.%m.%Y %H:%M"))
         self._brand_cache: dict[str, list[str]] = {}
         self._type_cache: dict[str, str] = {}
+        self._group_cache: dict[str, str] = {}
         self._loss_cache: dict[str, Sheet] = {}
         self.market_discount: float | None = None
 
     # --- службове ---------------------------------------------------------
 
-    def _step(self, text: str, done: int, total: int = 8) -> None:
+    def _step(self, text: str, done: int, total: int = ANALYSIS_STEPS) -> None:
         """Повідомляє про поступ і перевіряє, чи не просили зупинитись.
 
         Перевірка стоїть саме тут, між етапами: аналіз довгий, і без неї
@@ -246,11 +258,30 @@ class Analyzer(PlayersMixin, BenchmarkMixin):
         return found
 
     def _product_type(self, text: str) -> str:
+        """Назва товару так, як її написали в документі (без об'єднання)."""
         key = str(text or "")[:120]
         kind = self._type_cache.get(key)
         if kind is None:
             kind = product_type(key)
             self._type_cache[key] = kind
+        return kind
+
+    def _product_group(self, text: str) -> str:
+        """Родовий тип товару: «Миші», «Мишка» й «Миша дротова» — це «Миша».
+
+        Об'єднанням відає :mod:`app.core.products`; тут лише кеш, бо той самий
+        опис трапляється в десятках позицій.
+
+        Коли й довідник, і морфологія мовчать (опис без жодного кириличного
+        слова — «Post пост карта»), лишається дослівна назва. Так об'єднана
+        таблиця вміщає **рівно ті самі** позиції, що й таблиця «як у
+        документах»: об'єднання не має нічого втрачати дорогою.
+        """
+        key = str(text or "")[:200]
+        kind = self._group_cache.get(key)
+        if kind is None:
+            kind = product_group(key) or self._product_type(key)
+            self._group_cache[key] = kind
         return kind
 
     def _group_of(self, code: str) -> str:
@@ -261,6 +292,37 @@ class Analyzer(PlayersMixin, BenchmarkMixin):
 
     def is_ours(self, edrpou: str) -> bool:
         return edrpou in self.own
+
+    def _visible_ranking(self, ranking: Sequence[tuple[str, Any]], limit: int
+                         ) -> tuple[list[tuple[str, Any]], set[int]]:
+        """Видима частина рейтингу, у якій наші ТОВ є завжди.
+
+        Повертає відрізок рейтингу й номери позицій, які треба підсвітити.
+        Наше ТОВ, що не влізло в топ-N, дописується в хвіст — на позицію
+        N+1 і далі. Без цього графік мовчки ховав би саме ту компанію,
+        заради якої аналітику й відкривають: варто нашому ЄДРПОУ опинитися
+        нижчим за межу показу, і на «Топі постачальників» від нього не
+        лишалося ані смуги, ані підсвітки — а порожнє місце на графіку
+        читається як «нас на цьому ринку немає».
+
+        Порядок хвоста — той самий, що й у рейтингу, тож наші ТОВ між собою
+        лишаються за спаданням суми.
+        """
+        line = list(ranking[:limit])
+        line += [row for row in ranking[limit:] if self.is_ours(row[0])]
+        return line, {i for i, row in enumerate(line) if self.is_ours(row[0])}
+
+    def _rank_label(self, edrpou: str, limit: int) -> str:
+        """Підпис смуги: назва, а для дописаних у хвіст — ще й номер місця.
+
+        Смуга, що стоїть 16-ю в «топ-15», інакше читалася б як 16-те місце
+        ринку. Номер знімає це питання просто на графіку, не змушуючи шукати
+        його в таблиці.
+        """
+        rank = self.rank_of.get(edrpou, 0)
+        if rank <= limit:
+            return self._short_name(edrpou)
+        return f"{self._short_name(edrpou, 27)} (№{rank})"
 
     # --- 0. підготовка ----------------------------------------------------
 
@@ -382,7 +444,7 @@ class Analyzer(PlayersMixin, BenchmarkMixin):
                 "currency": row.get("currency") or "UAH",
                 "status": row.get("status") or "",
                 "date": date or tender.get("date", ""),
-                "month": (date or tender.get("date", ""))[:7],
+                "month": month_of(date or tender.get("date", "")),
                 "buyer": tender.get("buyer") or row.get("buyer") or "",
                 "buyer_edrpou": tender.get("buyer_edrpou") or row.get("buyer_edrpou") or "",
                 "region": tender.get("region") or row.get("region") or "",
@@ -891,14 +953,17 @@ class Analyzer(PlayersMixin, BenchmarkMixin):
                 [Series("Закупівель", months, [row[3] for row in monthly])],
                 unit="шт", money_axis=False, hint=edge_note.strip()))
 
-        top = ranking[:TOP_ROWS]
+        top, accent = self._visible_ranking(ranking, TOP_ROWS)
         block.charts.append(ChartData(
-            "Топ постачальників за сумою угод", "hbar",
+            f"Топ-{TOP_ROWS} постачальників за сумою угод", "hbar",
             [Series("Сума угод",
-                    [self._short_name(e) for e, _c in top],
+                    [self._rank_label(e, TOP_ROWS) for e, _c in top],
                     [cell["signed"] for _e, cell in top],
-                    accent={i for i, (e, _c) in enumerate(top) if self.is_ours(e)})],
-            unit="грн", hint="Наші ТОВ виділені кольором."))
+                    accent=accent)],
+            unit="грн",
+            hint="Наші ТОВ виділені кольором і показані завжди. Те, що не ввійшло "
+                 f"до топ-{TOP_ROWS}, дописане в кінець із номером свого місця "
+                 "в рейтингу."))
 
         methods = Counter()
         for deal in deals:
@@ -1016,15 +1081,15 @@ class Analyzer(PlayersMixin, BenchmarkMixin):
         expected: Counter[str] = Counter()
         counts: Counter[str] = Counter()
         for tender in self.tenders.values():
-            month = (tender["date"] or "")[:7]
+            month = month_of(tender["date"] or "")
             if month:
                 expected[month] += tender["value"] or 0.0
                 counts[month] += 1
         signed: Counter[str] = Counter()
         by_signature: Counter[str] = Counter()
         for deal in self.clean_deals:
-            published = (self.tenders.get(deal["tender_id"], {}).get("date")
-                         or deal["date"] or "")[:7]
+            published = month_of(self.tenders.get(deal["tender_id"], {}).get("date")
+                                 or deal["date"] or "")
             if published:
                 signed[published] += deal["amount"]
             if deal["month"]:
@@ -1196,29 +1261,49 @@ class Analyzer(PlayersMixin, BenchmarkMixin):
         return headers, rows
 
 
+def month_of(day: str) -> str:
+    """``2026-05-01`` → ``2026-05``; неможлива дата — порожньо.
+
+    Місяць звідси йде в математику прогнозу, яка робить із нього справжній
+    ``date``, і «2026-13» валило б **увесь** аналіз (виміряно: ``ValueError:
+    month must be in 1..12`` на першому ж перетворенні). Книга вивантаження
+    такого вже не дає — :func:`app.core.xlsxload.as_date` перевіряє дату, —
+    але ``Dataset`` можна скласти й повз неї, а ціна помилки тут — не
+    зіпсований рядок, а порожня сторінка аналітики.
+    """
+    if (len(day) >= 7 and day[4] == "-" and day[:4].isdigit() and day[5:7].isdigit()
+            and 1 <= int(day[5:7]) <= 12):
+        return day[:7]
+    return ""
+
+
 def _log10(value: float) -> float:
     return math.log10(value) if value and value > 0 else 0.0
 
 
 #: Порядок вкладок звіту. Підсумок збирається останнім, а показується першим.
-SECTIONS = ["Підсумок", "Очищення", "Ринок", "Наші ТОВ", "Конкуренти",
-            "Товари і ТМ", "Постачання", "Порівняння"]
+#: «Прогнозування» стоїть одразу за «Ринком»: воно продовжує ту саму місячну
+#: динаміку, і читати його окремо від неї немає сенсу.
+SECTIONS = ["Підсумок", "Очищення", "Ринок", "Прогнозування", "Відмови", "Наші ТОВ",
+            "Конкуренти", "Товари і ТМ", "Постачання", "Порівняння"]
 
 
 def analyse(data: Dataset, own_edrpou: Iterable[str] = (), tracked: Iterable[str] = (),
             drop_outliers: bool = True, top_competitors: int = TOP_COMPETITORS,
             on_progress: Callable[[str, int, int], None] | None = None,
-            cancel_event=None) -> Report:
+            cancel_event=None, horizon: int = DEFAULT_HORIZON) -> Report:
     """Повний аналіз книги. Єдина точка входу для інтерфейсу."""
     analyzer = Analyzer(data, own_edrpou, tracked, drop_outliers,
-                        top_competitors, on_progress, cancel_event)
+                        top_competitors, on_progress, cancel_event, horizon)
     analyzer.prepare()
     analyzer.clean()
     analyzer.market()
+    analyzer.rejections()
     analyzer.profiles()
     analyzer.brands()
     analyzer.supply()
     analyzer.compare()
+    analyzer.outlook()
     analyzer.summary()
     report = analyzer.report
     report.sections = {name: report.sections[name] for name in SECTIONS

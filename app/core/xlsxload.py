@@ -98,6 +98,22 @@ def as_int(value: Any) -> int:
     return int(number) if number is not None else 0
 
 
+def _valid_day(text: str) -> str:
+    """``YYYY-MM-DD``, якщо такий день справді існує; інакше порожньо.
+
+    Перевіряти конче треба: раніше досить було, щоб дефіси стояли на своїх
+    місцях, і «2026-13-45» проходило далі як дата. Одна така клітинка валила
+    **весь** аналіз — прогноз рахує місяці справжніми ``date``, і на першому ж
+    перетворенні виходило ``ValueError: month must be in 1..12``. Невідома
+    дата шкодить куди менше, ніж неможлива: рядок просто випадає з розрізів
+    за часом.
+    """
+    try:
+        return date.fromisoformat(text).isoformat()
+    except ValueError:
+        return ""
+
+
 def as_date(value: Any) -> str:
     """Дата у вигляді ``YYYY-MM-DD``; невпізнане — порожній рядок."""
     if value is None:
@@ -110,13 +126,17 @@ def as_date(value: Any) -> str:
         return ""
     text = str(value).strip()
     if len(text) >= 10 and text[4] == "-" and text[7] == "-":
-        return text[:10]
+        day = _valid_day(text[:10])
+        if day:
+            return day
     match = re.search(r"(\d{2})[.\-/](\d{2})[.\-/](\d{4})", text)
     if match:
         day, month, year = match.groups()
-        return f"{year}-{month}-{day}"
+        found = _valid_day(f"{year}-{month}-{day}")
+        if found:
+            return found
     match = re.search(r"\d{4}-\d{2}-\d{2}", text)
-    return match.group(0) if match else ""
+    return _valid_day(match.group(0)) if match else ""
 
 
 def as_edrpou(value: Any) -> str:
@@ -221,6 +241,25 @@ TABLES: dict[str, dict] = {
             "currency": ("валюта",),
             "status": ("статус рішення",),
             "decided": ("дата рішення",),
+            # Категорію причини книга теж містить, але сюди її не читаємо:
+            # аналітика класифікує текст сама, і завдяки цьому оновлений
+            # довідник причин діє й на давно вивантаженій книзі.
+            "reason": ("причина відмови",),
+            "explanation": ("пояснення відмови",),
+        },
+    },
+    "cancellations": {
+        "sheets": ("відміни закупівель", "відміни"),
+        "columns": {
+            "tender_id": ("номер закупівлі",),
+            "date": ("дата закупівлі",),
+            "buyer": ("замовник",),
+            "buyer_edrpou": ("єдрпоу замовника",),
+            "value": ("очікувана вартість",),
+            "cancelled": ("дата відміни",),
+            "status": ("статус відміни",),
+            "reason": ("підстава відміни",),
+            "explanation": ("обґрунтування",),
         },
     },
     "contracts": {
@@ -302,6 +341,7 @@ CASTS: dict[str, Callable[[Any], Any]] = {
     "size": as_int, "n_lots": as_int, "n_bids": as_int, "n_docs": as_int,
     "n_images": as_int, "n_specs": as_int, "description_len": as_int,
     "date": as_date, "signed": as_date, "submitted": as_date, "decided": as_date,
+    "cancelled": as_date,
     "published": as_date, "modified": as_date, "price_date": as_date,
     "tender_start": as_date, "tender_end": as_date,
     "edrpou": as_edrpou, "buyer_edrpou": as_edrpou, "owner_edrpou": as_edrpou,
@@ -311,6 +351,7 @@ CASTS: dict[str, Callable[[Any], Any]] = {
 TABLE_LABELS = {
     "tenders": "Закупівлі", "lots": "Лоти", "items": "Номенклатура",
     "bids": "Пропозиції", "awards": "Переможці", "contracts": "Договори",
+    "cancellations": "Відміни закупівель",
     "documents": "Документи", "products": "Товари каталогу",
     "specs": "Характеристики товарів",
 }
@@ -327,6 +368,7 @@ class Dataset:
     bids: list[Row] = field(default_factory=list)
     awards: list[Row] = field(default_factory=list)
     contracts: list[Row] = field(default_factory=list)
+    cancellations: list[Row] = field(default_factory=list)
     documents: list[Row] = field(default_factory=list)
     products: list[Row] = field(default_factory=list)
     specs: list[Row] = field(default_factory=list)
