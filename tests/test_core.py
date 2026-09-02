@@ -135,6 +135,14 @@ def test_index_chunks() -> None:
           tender_id_of("UA-2026-08-13-007779-a") == "UA-2026-08-13-007779-a")
 
 
+def _decodes_as_utf8(data: bytes) -> bool:
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
 def test_batch_files() -> None:
     """Файли запуску мають лишатися суто ASCII.
 
@@ -155,6 +163,20 @@ def test_batch_files() -> None:
         check(f"{name}: без BOM", not data.startswith(b"\xef\xbb\xbf"))
         text = data.decode("ascii", errors="replace")
         check(f"{name}: запускає застосунок", "-m app.main" in text)
+
+    # pip до 24.1 читає requirements.txt кодуванням системи, а не UTF-8:
+    # на українській Windows це cp1251/cp1252, і українські коментарі в файлі
+    # валили саму установку (`UnicodeDecodeError: 'charmap' codec can't decode
+    # byte 0x81`). Рятує рядок PEP-263 — pip шукає його у перших двох рядках.
+    req = root / "requirements.txt"
+    data = req.read_bytes()
+    head = data.splitlines()[:2]
+    check("requirements.txt: є оголошення кодування",
+          any(b"coding" in line and b"utf-8" in line.lower() and
+              line.lstrip().startswith(b"#") for line in head),
+          head[0].decode("utf-8", "replace") if head else "порожній файл")
+    check("requirements.txt: це справді UTF-8",
+          _decodes_as_utf8(data))
 
 
 def test_market() -> None:

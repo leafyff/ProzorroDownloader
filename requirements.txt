@@ -1,3 +1,8 @@
+# -*- coding: utf-8 -*-
+# Рядок вище — не окраса: pip (до 24.1) читає цей файл кодуванням системи, а на
+# українській Windows це cp1251/cp1252. Без нього коментарі нижче валили саму
+# установку: `UnicodeDecodeError: 'charmap' codec can't decode byte 0x81`.
+#
 # Програмі потрібні лише QtCore, QtGui та QtWidgets — вони всі в Essentials.
 # Повний пакет PySide6 тягне ще й Addons (QtWebEngine, Quick, Charts тощо):
 # це понад 400 МБ, які тут не використовуються.
