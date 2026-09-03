@@ -196,8 +196,8 @@ settings.tmp
 downloads/
 
 # Вивантажені таблиці, якщо зберегти їх повз теку downloads.
-prozorro-*.xlsx
-prozorro-*.csv
+# prozorro-*.xlsx
+# prozorro-*.csv
 
 # --- редактори та IDE ----------------------------------------------------
 *.iml
